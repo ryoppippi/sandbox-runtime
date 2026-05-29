@@ -43,6 +43,8 @@ export interface LinuxSandboxParams {
   caCertPath?: string
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
+  /** Environment variable names to unset inside the sandbox (bwrap --unsetenv) */
+  unsetEnvVars?: string[]
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
@@ -1076,6 +1078,7 @@ export async function wrapCommandWithSandboxLinux(
     caCertPath,
     readConfig,
     writeConfig,
+    unsetEnvVars,
     enableWeakerNestedSandbox,
     allowAllUnixSockets,
     binShell,
@@ -1093,12 +1096,15 @@ export async function wrapCommandWithSandboxLinux(
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
   const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
+  const hasEnvRestrictions =
+    unsetEnvVars !== undefined && unsetEnvVars.length > 0
 
   // Check if we need any sandboxing
   if (
     !needsNetworkRestriction &&
     !hasReadRestrictions &&
-    !hasWriteRestrictions
+    !hasWriteRestrictions &&
+    !hasEnvRestrictions
   ) {
     return command
   }
@@ -1139,6 +1145,17 @@ export async function wrapCommandWithSandboxLinux(
       logForDebugging(
         '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
       )
+    }
+
+    // ========== ENV RESTRICTIONS ==========
+    // Drop denied credential env vars from the inherited environment. Emitted
+    // before the proxy --setenv flags below: bwrap applies env operations in
+    // argument order, so SRT's own proxy plumbing vars survive even if a
+    // caller lists one of them as a denied credential.
+    if (hasEnvRestrictions) {
+      for (const name of unsetEnvVars) {
+        bwrapArgs.push('--unsetenv', name)
+      }
     }
 
     // ========== NETWORK RESTRICTIONS ==========
@@ -1289,6 +1306,7 @@ export async function wrapCommandWithSandboxLinux(
     if (needsNetworkRestriction) restrictions.push('network')
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
+    if (hasEnvRestrictions) restrictions.push('env')
     if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
