@@ -28,35 +28,53 @@ const CA_PEM = readFileSync(CA_CERT, 'utf8')
 
 const REAL_TOKEN = 'ghp_realsecret_abcdef0123456789'
 
+/** Host matcher for unit tests: exact equality. */
+const eq = (h: string, p: string) => h === p
+/** Host matcher that always allows — for tests of the substitution itself. */
+const any = () => true
+
 describe('SentinelRegistry', () => {
   test('register mints a fake_value_<uuid> sentinel', () => {
     const reg = new SentinelRegistry()
-    const s = reg.register('hunter2')
+    const s = reg.register('GH_TOKEN', 'hunter2', ['api.github.com'])
     expect(s.startsWith(SENTINEL_PREFIX)).toBe(true)
     // UUID v4 is 36 chars (8-4-4-4-12 with hyphens).
     expect(s.length).toBe(SENTINEL_PREFIX.length + 36)
     expect(reg.lookupReal(s)).toBe('hunter2')
   })
 
-  test('register is idempotent for the same real value', () => {
+  test('register is idempotent on credential name', () => {
     const reg = new SentinelRegistry()
-    const a = reg.register('hunter2')
-    const b = reg.register('hunter2')
+    const a = reg.register('GH_TOKEN', 'hunter2', ['api.github.com'])
+    const b = reg.register('GH_TOKEN', 'hunter2', ['api.github.com'])
     expect(a).toBe(b)
     expect(reg.size).toBe(1)
   })
 
-  test('different real values get different sentinels', () => {
+  test('re-registering a name updates value and hosts but keeps the sentinel', () => {
     const reg = new SentinelRegistry()
-    const a = reg.register('one')
-    const b = reg.register('two')
+    const a = reg.register('T', 'old', ['old.example.com'])
+    const b = reg.register('T', 'new', ['new.example.com'])
+    expect(b).toBe(a)
+    expect(reg.lookupReal(a)).toBe('new')
+    const headers: IncomingHttpHeaders = { authorization: a }
+    reg.substituteInHeaders(headers, 'new.example.com', eq)
+    expect(headers.authorization).toBe('new')
+  })
+
+  test('different names get different sentinels even for the same value', () => {
+    // Per-credential host gating must apply independently, so two env
+    // vars carrying the same secret still need distinct sentinels.
+    const reg = new SentinelRegistry()
+    const a = reg.register('A', 'same', ['a.example.com'])
+    const b = reg.register('B', 'same', ['b.example.com'])
     expect(a).not.toBe(b)
     expect(reg.size).toBe(2)
   })
 
   test('clear drops every mapping', () => {
     const reg = new SentinelRegistry()
-    const s = reg.register('x')
+    const s = reg.register('T', 'x', [])
     reg.clear()
     expect(reg.size).toBe(0)
     expect(reg.lookupReal(s)).toBeUndefined()
@@ -64,14 +82,14 @@ describe('SentinelRegistry', () => {
 
   test('substituteInHeaders replaces sentinels in any header value', () => {
     const reg = new SentinelRegistry()
-    const s = reg.register(REAL_TOKEN)
+    const s = reg.register('GH_TOKEN', REAL_TOKEN, ['api.github.com'])
     const headers: IncomingHttpHeaders = {
       authorization: `Bearer ${s}`,
       'x-api-key': s,
       'set-cookie': [`token=${s}; Path=/`, 'unrelated=1'],
       'user-agent': 'curl/8',
     }
-    reg.substituteInHeaders(headers)
+    reg.substituteInHeaders(headers, 'api.github.com', any)
     expect(headers.authorization).toBe(`Bearer ${REAL_TOKEN}`)
     expect(headers['x-api-key']).toBe(REAL_TOKEN)
     expect(headers['set-cookie']).toEqual([
@@ -83,10 +101,48 @@ describe('SentinelRegistry', () => {
 
   test('substituteInHeaders leaves headers without sentinels unchanged', () => {
     const reg = new SentinelRegistry()
-    reg.register(REAL_TOKEN)
+    reg.register('GH_TOKEN', REAL_TOKEN, ['api.github.com'])
     const headers: IncomingHttpHeaders = { authorization: 'Bearer plain' }
-    reg.substituteInHeaders(headers)
+    reg.substituteInHeaders(headers, 'api.github.com', any)
     expect(headers.authorization).toBe('Bearer plain')
+  })
+
+  test("a sentinel only substitutes at its own credential's injectHosts", () => {
+    // Anti-laundering: sending GH_TOKEN's sentinel to NPM_TOKEN's host
+    // must NOT swap in the GH secret.
+    const reg = new SentinelRegistry()
+    const gh = reg.register('GH_TOKEN', 'gh-secret', ['api.github.com'])
+    const npm = reg.register('NPM_TOKEN', 'npm-secret', ['registry.npmjs.org'])
+
+    const toNpm: IncomingHttpHeaders = { authorization: `Bearer ${gh}` }
+    reg.substituteInHeaders(toNpm, 'registry.npmjs.org', eq)
+    expect(toNpm.authorization).toBe(`Bearer ${gh}`)
+
+    const toGh: IncomingHttpHeaders = { authorization: `Bearer ${npm}` }
+    reg.substituteInHeaders(toGh, 'api.github.com', eq)
+    expect(toGh.authorization).toBe(`Bearer ${npm}`)
+
+    // Each credential does swap at its own host.
+    const ghOwn: IncomingHttpHeaders = { authorization: `Bearer ${gh}` }
+    reg.substituteInHeaders(ghOwn, 'api.github.com', eq)
+    expect(ghOwn.authorization).toBe('Bearer gh-secret')
+
+    const npmOwn: IncomingHttpHeaders = { authorization: `Bearer ${npm}` }
+    reg.substituteInHeaders(npmOwn, 'registry.npmjs.org', eq)
+    expect(npmOwn.authorization).toBe('Bearer npm-secret')
+  })
+
+  test('mixed sentinels in one request: only the host-matched one swaps', () => {
+    const reg = new SentinelRegistry()
+    const gh = reg.register('GH_TOKEN', 'gh-secret', ['api.github.com'])
+    const npm = reg.register('NPM_TOKEN', 'npm-secret', ['registry.npmjs.org'])
+    const headers: IncomingHttpHeaders = {
+      authorization: `Bearer ${gh}`,
+      'x-npm-token': npm,
+    }
+    reg.substituteInHeaders(headers, 'api.github.com', eq)
+    expect(headers.authorization).toBe('Bearer gh-secret')
+    expect(headers['x-npm-token']).toBe(npm)
   })
 })
 
@@ -127,7 +183,7 @@ describe('macOS env preamble for masked credentials', () => {
 describe('header injection through the TLS-terminating proxy', () => {
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const reg = new SentinelRegistry()
-  const sentinel = reg.register(REAL_TOKEN)
+  const sentinel = reg.register('GH_TOKEN', REAL_TOKEN, ['127.0.0.1'])
 
   let upstream: Server
   let upstreamPort: number
@@ -155,10 +211,10 @@ describe('header injection through the TLS-terminating proxy', () => {
       filter: () => true,
       mitmCA: ca,
       tlsTerminateUpstreamCA: CA_PEM,
-      // Inject only when the destination is 127.0.0.1.
-      mutateHeaders: (headers, destHost) => {
-        if (destHost === '127.0.0.1') reg.substituteInHeaders(headers)
-      },
+      // Per-sentinel host gating lives in the registry now; the closure
+      // just forwards destHost.
+      mutateHeaders: (headers, destHost) =>
+        reg.substituteInHeaders(headers, destHost, eq),
     })
     await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
     proxyPort = (proxy.address() as AddressInfo).port
@@ -231,9 +287,9 @@ describe('header injection through the TLS-terminating proxy', () => {
 
 describe('header injection on the plain-HTTP path', () => {
   const reg = new SentinelRegistry()
-  const sentinel = reg.register(REAL_TOKEN)
-  const mutate = (headers: IncomingHttpHeaders) =>
-    reg.substituteInHeaders(headers)
+  const sentinel = reg.register('GH_TOKEN', REAL_TOKEN, ['127.0.0.1'])
+  const mutate = (headers: IncomingHttpHeaders, destHost: string) =>
+    reg.substituteInHeaders(headers, destHost, eq)
 
   let upstream: Server
   let upstreamPort: number

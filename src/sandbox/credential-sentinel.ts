@@ -13,85 +13,126 @@ import type { IncomingHttpHeaders } from 'node:http'
 
 export const SENTINEL_PREFIX = 'fake_value_'
 
+/** Predicate matching a destination host against one injectHosts pattern. */
+export type HostMatcher = (host: string, pattern: string) => boolean
+
+interface SentinelEntry {
+  readonly name: string
+  readonly sentinel: string
+  realValue: string
+  injectHosts: readonly string[]
+}
+
 /**
- * Bidirectional sentinel↔real-value map for one sandbox session.
+ * Sentinel↔real-value map for one sandbox session, keyed by credential name.
  *
- * `register()` is idempotent for a given real value so a credential carried
- * by multiple sources (e.g. the same token in two env vars) maps to one
- * sentinel and one substitution.
+ * Each credential carries its own `injectHosts` list, and substitution is
+ * gated per sentinel: a sentinel is swapped to its real value only when the
+ * destination matches THAT credential's hosts. This prevents laundering
+ * credential A through credential B's allowlisted host by sending A's
+ * sentinel there — the proxy leaves A's sentinel intact on B's host.
+ *
+ * Keying on name (not value) means two env vars holding the same secret get
+ * distinct sentinels, so each can have an independent host list.
  */
 export class SentinelRegistry {
-  private readonly sentinelToReal = new Map<string, string>()
-  private readonly realToSentinel = new Map<string, string>()
+  private readonly byName = new Map<string, SentinelEntry>()
+  private readonly bySentinel = new Map<string, SentinelEntry>()
 
   /**
-   * Return the sentinel for `realValue`, minting a fresh one on first use.
-   * The sentinel is `fake_value_<uuid4>`: long enough that an accidental
-   * collision with legitimate header content is negligible, and free of
-   * shell/URL metacharacters so it survives `--setenv` and `env NAME=value`
-   * unquoted.
+   * Return the sentinel for the credential named `name`, minting a fresh one
+   * on first use. The sentinel is `fake_value_<uuid4>`: long enough that an
+   * accidental collision with legitimate header content is negligible, and
+   * free of shell/URL metacharacters so it survives `--setenv` and
+   * `env NAME=value` unquoted.
+   *
+   * Idempotent on `name`: a repeat call returns the same sentinel and updates
+   * `realValue`/`injectHosts` in place so `updateConfig()` can change either
+   * without invalidating sentinels the sandboxed process has already read.
    */
-  register(realValue: string): string {
-    const existing = this.realToSentinel.get(realValue)
-    if (existing !== undefined) return existing
+  register(
+    name: string,
+    realValue: string,
+    injectHosts: readonly string[],
+  ): string {
+    const existing = this.byName.get(name)
+    if (existing !== undefined) {
+      existing.realValue = realValue
+      existing.injectHosts = injectHosts
+      return existing.sentinel
+    }
     const sentinel = SENTINEL_PREFIX + randomUUID()
-    this.sentinelToReal.set(sentinel, realValue)
-    this.realToSentinel.set(realValue, sentinel)
+    const entry: SentinelEntry = { name, sentinel, realValue, injectHosts }
+    this.byName.set(name, entry)
+    this.bySentinel.set(sentinel, entry)
     return sentinel
   }
 
   /** Real value for `sentinel`, or undefined if not registered. */
   lookupReal(sentinel: string): string | undefined {
-    return this.sentinelToReal.get(sentinel)
+    return this.bySentinel.get(sentinel)?.realValue
   }
 
   /** Iterate registered `[sentinel, realValue]` pairs. */
-  entries(): IterableIterator<[string, string]> {
-    return this.sentinelToReal.entries()
+  *entries(): IterableIterator<[string, string]> {
+    for (const e of this.bySentinel.values()) yield [e.sentinel, e.realValue]
   }
 
   /** Number of registered sentinels. */
   get size(): number {
-    return this.sentinelToReal.size
+    return this.bySentinel.size
   }
 
   /** Drop every mapping. Called on session teardown. */
   clear(): void {
-    this.sentinelToReal.clear()
-    this.realToSentinel.clear()
+    this.byName.clear()
+    this.bySentinel.clear()
   }
 
   /**
-   * Replace every registered sentinel found in `headers` with its real
-   * value, in place. Scans all header values rather than a fixed set —
-   * a sentinel showing up anywhere is the substitution trigger, regardless
-   * of header name (Authorization, X-Api-Key, Private-Token, ...).
+   * Replace registered sentinels found in `headers` with their real values,
+   * in place. Each sentinel substitutes only when `destHost` matches one of
+   * THAT credential's `injectHosts` patterns (via `matches`); a sentinel
+   * whose host list does not cover `destHost` is left as the useless fake.
    *
-   * The caller is responsible for gating this on transport (TLS-terminated
-   * path only) and destination (`injectHosts`); this function performs the
-   * substitution unconditionally.
+   * Scans all header values rather than a fixed set — a sentinel showing up
+   * anywhere is the substitution trigger, regardless of header name
+   * (Authorization, X-Api-Key, Private-Token, ...).
+   *
+   * The caller remains responsible for transport gating (TLS-terminated path
+   * unless `allowPlaintextInject`).
    */
-  substituteInHeaders(headers: IncomingHttpHeaders): void {
-    if (this.sentinelToReal.size === 0) return
+  substituteInHeaders(
+    headers: IncomingHttpHeaders,
+    destHost: string,
+    matches: HostMatcher,
+  ): void {
+    if (this.bySentinel.size === 0) return
     for (const [name, value] of Object.entries(headers)) {
       if (value === undefined) continue
       if (Array.isArray(value)) {
         for (let i = 0; i < value.length; i++) {
-          value[i] = this.substituteInString(value[i]!)
+          value[i] = this.substituteInString(value[i]!, destHost, matches)
         }
       } else {
-        headers[name] = this.substituteInString(value)
+        headers[name] = this.substituteInString(value, destHost, matches)
       }
     }
   }
 
-  private substituteInString(s: string): string {
+  private substituteInString(
+    s: string,
+    destHost: string,
+    matches: HostMatcher,
+  ): string {
     // Fast path: the sentinel prefix is fixed, so a header value that
     // doesn't contain it cannot contain any sentinel.
     if (!s.includes(SENTINEL_PREFIX)) return s
     let out = s
-    for (const [sentinel, real] of this.sentinelToReal) {
-      if (out.includes(sentinel)) out = out.split(sentinel).join(real)
+    for (const e of this.bySentinel.values()) {
+      if (!out.includes(e.sentinel)) continue
+      if (!e.injectHosts.some(p => matches(destHost, p))) continue
+      out = out.split(e.sentinel).join(e.realValue)
     }
     return out
   }

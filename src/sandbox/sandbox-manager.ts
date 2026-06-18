@@ -203,24 +203,23 @@ async function filterNetworkRequest(
  */
 /**
  * Build the header-mutation callback that substitutes sentinel→real for
- * masked credentials when (and only when) the destination matches
- * `credentials.injectHosts`. Returns undefined when no injectHosts are
+ * masked credentials. Returns undefined when no `credentials` block is
  * configured — wiring the seam at all is unnecessary then.
  *
- * Reads `config` per-call so `updateConfig()` changes to injectHosts are
- * picked up without restarting the proxy. The returned closure does not
- * log header values; the registry holds the only copy of the real value.
+ * Per-host gating happens inside the registry: each sentinel carries its
+ * own injectHosts list and substitutes independently, so credential A's
+ * sentinel cannot be laundered through credential B's allowed host. The
+ * returned closure does not log header values; the registry holds the only
+ * copy of the real value.
  */
 function buildCredentialInjector(): MutateForwardedHeaders | undefined {
   if (!config?.credentials) return undefined
   return (headers, destHost) => {
-    if (sentinelRegistry.size === 0) return
-    for (const pattern of config?.credentials?.injectHosts ?? []) {
-      if (matchesDomainPattern(destHost, pattern)) {
-        sentinelRegistry.substituteInHeaders(headers)
-        return
-      }
-    }
+    sentinelRegistry.substituteInHeaders(
+      headers,
+      destHost,
+      matchesDomainPattern,
+    )
   }
 }
 
@@ -615,13 +614,18 @@ function getCredentialRestrictions(
 
   const unsetEnvVars: string[] = []
   const setEnvVars: Record<string, string> = {}
-  for (const { name, mode } of credentials.envVars ?? []) {
-    if (mode === 'deny') {
-      unsetEnvVars.push(name)
-    } else if (mode === 'mask') {
-      const real = process.env[name]
+  const defaultInjectHosts = credentials.injectHosts ?? []
+  for (const v of credentials.envVars ?? []) {
+    if (v.mode === 'deny') {
+      unsetEnvVars.push(v.name)
+    } else if (v.mode === 'mask') {
+      const real = process.env[v.name]
       if (real === undefined) continue
-      setEnvVars[name] = sentinelRegistry.register(real)
+      setEnvVars[v.name] = sentinelRegistry.register(
+        v.name,
+        real,
+        defaultInjectHosts,
+      )
     }
   }
 
