@@ -174,8 +174,8 @@ function repoRoot(): string {
 /**
  * Locate `srt-win.exe`. Resolution order:
  *   1. `SRT_WIN_PATH` env var (CI sets this to the freshly-built binary).
- *   2. `<repo>/vendor/srt-win/target/release/srt-win.exe` (local cargo build).
- *   3. `<repo>/dist/vendor/srt-win/target/release/srt-win.exe`
+ *   2. `<repo>/vendor/srt-win-src/target/release/srt-win.exe` (local cargo build).
+ *   3. `<repo>/dist/vendor/srt-win-src/target/release/srt-win.exe`
  *      (post-`npm run build` shape, when running from compiled output).
  *
  * Resolution via the optional `@anthropic-ai/sandbox-runtime-win32-*`
@@ -190,12 +190,19 @@ export function getSrtWinPath(): string {
   }
   const root = repoRoot()
   const candidates = [
-    path.join(root, 'vendor', 'srt-win', 'target', 'release', 'srt-win.exe'),
+    path.join(
+      root,
+      'vendor',
+      'srt-win-src',
+      'target',
+      'release',
+      'srt-win.exe',
+    ),
     path.join(
       root,
       'dist',
       'vendor',
-      'srt-win',
+      'srt-win-src',
       'target',
       'release',
       'srt-win.exe',
@@ -206,7 +213,7 @@ export function getSrtWinPath(): string {
   }
   throw new Error(
     `srt-win.exe not found. Set SRT_WIN_PATH or build with ` +
-      `\`cargo build --release --manifest-path vendor/srt-win/Cargo.toml\`. ` +
+      `\`cargo build --release --manifest-path vendor/srt-win-src/Cargo.toml\`. ` +
       `Looked in: ${[envPath, ...candidates].filter(Boolean).join(', ')}`,
   )
 }
@@ -523,7 +530,7 @@ export function createWindowsWfp(
  * Caller MUST spawn the result with `{shell: false}` — that is the
  * security boundary that keeps untrusted bytes off the host's shell
  * (the inner `cmd.exe /c` runs INSIDE the sandbox; see
- * `vendor/srt-win/src/launch.rs` `build_cmdline` for the passthrough
+ * `vendor/srt-win-src/src/launch.rs` `build_cmdline` for the passthrough
  * rationale) — AND with the returned `env`.
  *
  * Proxy configuration is single-sourced by {@link generateProxyEnvVars}

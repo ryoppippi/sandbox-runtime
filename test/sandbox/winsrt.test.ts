@@ -32,7 +32,7 @@ import {
  * sandbox state on the same machine.
  *
  * Real end-to-end (the actual fence) is also covered by
- * `vendor/srt-win/ci/smoke-exec.ps1` which runs before this file in
+ * `vendor/srt-win-src/ci/smoke-exec.ps1` which runs before this file in
  * CI; this suite proves the TS layer wires correctly on top.
  */
 
