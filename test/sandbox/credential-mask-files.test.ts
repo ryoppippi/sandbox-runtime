@@ -422,6 +422,63 @@ describe.if(isLinux)('structured file masking on Linux (extract)', () => {
 })
 
 /**
+ * Linux: an `extract` pattern that matches nothing must NOT bind the
+ * real file — that would expose the credential the entry was meant to
+ * protect. Instead the entry degrades to deny: reading the file inside
+ * the sandbox fails.
+ */
+describe.if(isLinux)('extract no-match degrades to deny on Linux', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
+  const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
+  const SECRET = 'gho_nomatch_real_0123456789'
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: SECRET_FILE,
+            mode: 'mask',
+            extract: 'will_not_match_(\\S+)',
+          },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  test('reading the file inside the sandbox is denied (fail-closed)', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    // The real credential never appears in the wrapped command.
+    expect(wrapped).not.toContain(SECRET)
+    // No --ro-bind <fake> <real> — degraded entries go via denyRead, not
+    // the masked-file bind path.
+    expect(wrapped).not.toMatch(
+      new RegExp(`--ro-bind \\S+\\.fake ${SECRET_FILE.replace(/\//g, '\\/')}`),
+    )
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    // cat fails: the file is unreadable inside the sandbox, and the
+    // real bytes are never exposed on stdout.
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain(SECRET)
+  })
+})
+
+/**
  * macOS: SBPL cannot redirect a read, so a masked file degrades to a
  * (deny file-read* …) rule — same profile output as mode: "deny". The
  * fakePath is unused. Pure string assertion; runs on any platform.
