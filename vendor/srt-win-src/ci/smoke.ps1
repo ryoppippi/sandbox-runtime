@@ -6,10 +6,10 @@
   and Fwpm* both need admin).
 
   Usage (local dev machine):
-    pwsh vendor/srt-win/ci/smoke.ps1 .\target\release\srt-win.exe
+    pwsh vendor/srt-win-src/ci/smoke.ps1 .\target\release\srt-win.exe
 
   Usage (CI — workflow passes the path):
-    pwsh vendor/srt-win/ci/smoke.ps1 vendor\srt-win\target\release\srt-win.exe
+    pwsh vendor/srt-win-src/ci/smoke.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
   All WFP operations target $TestSublayer (a fixed test GUID), NOT
   the production default sublayer — safe to run on a dev machine

@@ -7,7 +7,7 @@
   smoke.ps1 wrote one to $env:SRT_ALT_GUID.
 
   Usage:
-    pwsh vendor/srt-win/ci/cleanup.ps1 <path-to-srt-win.exe> [group-name]
+    pwsh vendor/srt-win-src/ci/cleanup.ps1 <path-to-srt-win.exe> [group-name]
 #>
 param(
   [Parameter(Mandatory = $true)]

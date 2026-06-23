@@ -171,12 +171,21 @@ function repoRoot(): string {
   return path.resolve(here, '..', '..')
 }
 
+const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
+
 /**
  * Locate `srt-win.exe`. Resolution order:
  *   1. `SRT_WIN_PATH` env var (CI sets this to the freshly-built binary).
- *   2. `<repo>/vendor/srt-win/target/release/srt-win.exe` (local cargo build).
- *   3. `<repo>/dist/vendor/srt-win/target/release/srt-win.exe`
- *      (post-`npm run build` shape, when running from compiled output).
+ *   2. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt — published npm
+ *      package, or after `npm run build:srt-win` locally).
+ *   3. `<root>/vendor/srt-win-src/target/release/srt-win.exe` (local
+ *      `cargo build --release` fallback for development).
+ *   4. `<root>/vendor/srt-win/target/release/srt-win.exe` (transitional:
+ *      stale local build from before the srt-win-src rename).
+ *
+ * `<root>` is {@link repoRoot} — `__dirname/../..`, which resolves to the
+ * repo root from `src/sandbox/` and `dist/sandbox/` alike, and to the
+ * package root when installed under `node_modules`.
  *
  * Resolution via the optional `@anthropic-ai/sandbox-runtime-win32-*`
  * platform packages is added separately.
@@ -189,24 +198,29 @@ export function getSrtWinPath(): string {
     return envPath
   }
   const root = repoRoot()
-  const candidates = [
-    path.join(root, 'vendor', 'srt-win', 'target', 'release', 'srt-win.exe'),
+  const arch = nodeArchToDir[process.arch]
+  const candidates: string[] = []
+  if (arch) {
+    candidates.push(path.join(root, 'vendor', 'srt-win', arch, 'srt-win.exe'))
+  }
+  candidates.push(
     path.join(
       root,
-      'dist',
       'vendor',
-      'srt-win',
+      'srt-win-src',
       'target',
       'release',
       'srt-win.exe',
     ),
-  ]
+    // transitional: stale local build from before the srt-win-src rename
+    path.join(root, 'vendor', 'srt-win', 'target', 'release', 'srt-win.exe'),
+  )
   for (const c of candidates) {
     if (fs.existsSync(c)) return c
   }
   throw new Error(
     `srt-win.exe not found. Set SRT_WIN_PATH or build with ` +
-      `\`cargo build --release --manifest-path vendor/srt-win/Cargo.toml\`. ` +
+      `\`cargo build --release --manifest-path vendor/srt-win-src/Cargo.toml\`. ` +
       `Looked in: ${[envPath, ...candidates].filter(Boolean).join(', ')}`,
   )
 }
@@ -523,7 +537,7 @@ export function createWindowsWfp(
  * Caller MUST spawn the result with `{shell: false}` — that is the
  * security boundary that keeps untrusted bytes off the host's shell
  * (the inner `cmd.exe /c` runs INSIDE the sandbox; see
- * `vendor/srt-win/src/launch.rs` `build_cmdline` for the passthrough
+ * `vendor/srt-win-src/src/launch.rs` `build_cmdline` for the passthrough
  * rationale) — AND with the returned `env`.
  *
  * Proxy configuration is single-sourced by {@link generateProxyEnvVars}
