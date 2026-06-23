@@ -88,15 +88,4 @@ run([
 run(['strip', join(OUT, 'apply-seccomp')])
 rmSync(header)
 
-run([
-  'gcc',
-  ...cflags,
-  '-o',
-  join(OUT, 'srt-seccomp-supervisor'),
-  join(SRC, 'srt-seccomp-supervisor.c'),
-])
-run(['strip', join(OUT, 'srt-seccomp-supervisor')])
-
-console.log(
-  'built ' + join(OUT, 'apply-seccomp') + ' and srt-seccomp-supervisor',
-)
+console.log('built ' + join(OUT, 'apply-seccomp'))

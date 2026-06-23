@@ -62,10 +62,10 @@ export interface LinuxSandboxParams {
   bwrapPath?: string
   /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
   socatPath?: string
-  /** Filesystem unix socket bound by srt-seccomp-supervisor. When set, the
-   *  socket is bind-mounted into the sandbox and apply-seccomp is told (via
-   *  SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and hand
-   *  its listener fd over that socket. */
+  /** Filesystem unix socket bound by the Linux violation monitor. When set,
+   *  the socket is bind-mounted into the sandbox and apply-seccomp is told
+   *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
+   *  stream observed write-intent paths over that socket as newline JSON. */
   observeSocketPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal

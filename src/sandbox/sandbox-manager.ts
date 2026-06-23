@@ -35,7 +35,6 @@ import {
   startLinuxSandboxViolationMonitor,
   type LinuxViolationMonitor,
 } from './linux-violation-monitor.js'
-import { getSeccompSupervisorBinaryPath } from './generate-seccomp-filter.js'
 import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
@@ -407,30 +406,24 @@ async function initialize(
     logForDebugging('Started macOS sandbox log monitor')
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
-    const supervisorPath = getSeccompSupervisorBinaryPath(
-      config.seccomp?.supervisorPath,
+    linuxMonitor = startLinuxSandboxViolationMonitor(
+      sandboxViolationStore.addViolation.bind(sandboxViolationStore),
+      {
+        // apply-seccomp's observer reports every write-intent syscall
+        // (allowed or not). Only paths bwrap would actually refuse — outside
+        // allowWrite or inside a denyWrite carve-out — go to the store.
+        allowWritePaths: [
+          ...getDefaultWritePaths(),
+          ...config.filesystem.allowWrite,
+        ],
+        denyWritePaths: config.filesystem.denyWrite,
+        ignoreViolations: config.ignoreViolations,
+      },
     )
-    if (supervisorPath) {
-      linuxMonitor = startLinuxSandboxViolationMonitor(
-        sandboxViolationStore.addViolation.bind(sandboxViolationStore),
-        {
-          supervisorPath,
-          // The supervisor reports every write-intent syscall (allowed or
-          // not). Only paths bwrap would actually refuse — outside allowWrite
-          // or inside a denyWrite carve-out — are forwarded to the store.
-          allowWritePaths: [
-            ...getDefaultWritePaths(),
-            ...config.filesystem.allowWrite,
-          ],
-          denyWritePaths: config.filesystem.denyWrite,
-          ignoreViolations: config.ignoreViolations,
-        },
-      )
-      // Don't block initialization on the supervisor's READY — wrap-time
-      // checks fs.existsSync(observeSocketPath) and degrades gracefully.
-      void linuxMonitor.ready
-      logForDebugging('Started Linux seccomp violation monitor')
-    }
+    // Don't block initialization on listen() — wrap-time checks
+    // fs.existsSync(observeSocketPath) and degrades gracefully.
+    void linuxMonitor.ready
+    logForDebugging('Started Linux seccomp violation monitor')
   }
 
   // Register cleanup handlers first time

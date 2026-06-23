@@ -1,6 +1,6 @@
-import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { createServer, type Server, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -14,13 +14,12 @@ import type { IgnoreViolationsConfig } from './sandbox-config.js'
 import { decodeSandboxedCommand } from './sandbox-utils.js'
 
 export interface LinuxViolationMonitorOptions {
-  /** Path to the srt-seccomp-supervisor binary. */
-  supervisorPath: string
   /**
-   * Paths bwrap mounts read-write. The supervisor reports every write-intent
-   * syscall (allowed or not, since the BPF filter cannot see the mount
-   * table); a path is treated as a violation only when it is *not* under any
-   * of these prefixes, or when it falls under {@link denyWritePaths}.
+   * Paths bwrap mounts read-write. apply-seccomp's USER_NOTIF observer
+   * reports every write-intent syscall (allowed or not, since the BPF filter
+   * cannot see the mount table); a path is treated as a violation only when
+   * it is *not* under any of these prefixes, or when it falls under
+   * {@link denyWritePaths}.
    */
   allowWritePaths: string[]
   /** Paths bwrap re-mounts read-only inside an allowWrite region. */
@@ -29,18 +28,17 @@ export interface LinuxViolationMonitorOptions {
 }
 
 export interface LinuxViolationMonitor {
-  /** Filesystem unix-socket path the supervisor is listening on. Bind-mount
-   *  this into each bwrap sandbox and pass it to apply-seccomp via
-   *  SRT_OBSERVE_SOCK. `undefined` if the supervisor failed to start (the
-   *  caller should proceed without observation). */
+  /** Filesystem unix-socket path the listener is bound to. Bind-mount this
+   *  into each bwrap sandbox and pass it to apply-seccomp via
+   *  SRT_OBSERVE_SOCK. `undefined` if listen() failed (the caller should
+   *  proceed without observation). */
   observeSocketPath: string | undefined
-  /** Resolves once the supervisor has bound its listener and printed READY,
-   *  or resolves anyway on startup failure. */
+  /** Resolves once the listener is bound, or on listen failure. */
   ready: Promise<void>
   stop: () => void
 }
 
-interface SupervisorEvent {
+interface ObserveEvent {
   nr?: number
   syscall?: string
   pid?: number
@@ -50,56 +48,35 @@ interface SupervisorEvent {
 }
 
 /**
- * Linux equivalent of {@link startMacOSSandboxLogMonitor}. Spawns a single
- * long-lived `srt-seccomp-supervisor` that owns a filesystem unix socket;
- * each `apply-seccomp` instance connects to it and hands over a
- * SECCOMP_RET_USER_NOTIF listener fd. The supervisor poll()s every listener,
- * answers every notification with CONTINUE (so the workload is never
- * blocked), and writes one JSON line per observed write-intent syscall to
- * stdout, which this function parses and feeds to {@link callback}.
+ * Linux equivalent of {@link startMacOSSandboxLogMonitor}. Creates a single
+ * filesystem unix-socket listener; each `apply-seccomp` instance's outer stub
+ * connects to it and writes one JSON line per observed write-intent syscall.
+ * The supervise loop lives inside `apply-seccomp` itself (the parent that
+ * already waitpid()s the workload), so there is no separate supervisor binary.
  *
  * Unlike Seatbelt's `log stream`, the kernel reports *attempts* here, not
  * denials, so this function intersects each path against the configured
  * allow/deny set before forwarding it as a violation.
  *
+ * The reported path is read out of the (untrusted) sandboxed process's memory
+ * with process_vm_readv and is therefore ATTACKER-CONTROLLED and racy. bwrap's
+ * mount table is the only enforcement boundary; the violation events emitted
+ * here are diagnostic hints and must never gate a policy decision.
+ *
  * The transport is a *filesystem* unix socket because bwrap runs with
- * `--unshare-net` (abstract sockets are net-namespace-scoped) and bwrap
- * closes inherited fds (so a socketpair cannot be threaded through).
- * Filesystem sockets survive across net + user + mount namespaces as long as
- * the path is bind-mounted into the sandbox.
+ * `--unshare-net` (abstract sockets are net-namespace-scoped) and bwrap closes
+ * inherited fds. Filesystem sockets survive across net + user + mount
+ * namespaces as long as the path is bind-mounted into the sandbox.
  */
 export function startLinuxSandboxViolationMonitor(
   callback: SandboxViolationCallback,
   opts: LinuxViolationMonitorOptions,
 ): LinuxViolationMonitor {
-  const { supervisorPath, allowWritePaths, denyWritePaths, ignoreViolations } =
-    opts
-
-  if (!supervisorPath || !existsSync(supervisorPath)) {
-    logForDebugging(
-      `[Sandbox Linux Monitor] supervisor binary not found at ${supervisorPath} - violation monitoring disabled`,
-      { level: 'warn' },
-    )
-    return {
-      observeSocketPath: undefined,
-      ready: Promise.resolve(),
-      stop: () => {},
-    }
-  }
+  const { allowWritePaths, denyWritePaths, ignoreViolations } = opts
 
   // sun_path is 108 bytes; mkdtemp under tmpdir() keeps us well under.
   const sockDir = mkdtempSync(join(tmpdir(), 'srt-obs-'))
   const sockPath = join(sockDir, `s${randomBytes(4).toString('hex')}.sock`)
-
-  let proc: ChildProcess | undefined = spawn(supervisorPath, [sockPath], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-
-  let resolveReady: () => void
-  let isReady = false
-  const ready = new Promise<void>(res => {
-    resolveReady = res
-  })
 
   const wildcardPaths = ignoreViolations?.['*'] ?? []
   const commandPatterns = ignoreViolations
@@ -111,7 +88,7 @@ export function startLinuxSandboxViolationMonitor(
 
   /** A write attempt is a violation iff bwrap would refuse it: outside every
    *  allowWrite prefix, or back inside a denyWrite carve-out. Relative paths
-   *  (dirfd-relative) are reported as-is — we can't resolve them without the
+   *  (dirfd-relative) are reported as-is — we cannot resolve them without the
    *  tracee's cwd, so err on the side of reporting. */
   const isDenied = (p: string): boolean => {
     if (!p.startsWith('/')) return true
@@ -131,20 +108,10 @@ export function startLinuxSandboxViolationMonitor(
     return false
   }
 
-  const rl = createInterface({ input: proc.stdout! })
-  rl.on('line', raw => {
-    if (!raw) return
-    if (raw === 'READY') {
-      isReady = true
-      resolveReady()
-      return
-    }
-    let ev: SupervisorEvent
-    try {
-      ev = JSON.parse(raw) as SupervisorEvent
-    } catch {
-      return
-    }
+  const handleEvent = (
+    ev: ObserveEvent,
+    encodedCommand: string | undefined,
+  ): void => {
     if (ev.observe_init_error) {
       logForDebugging(
         `[Sandbox Linux Monitor] observe filter not installed: ${ev.observe_init_error}`,
@@ -155,9 +122,9 @@ export function startLinuxSandboxViolationMonitor(
     if (!isDenied(ev.path)) return
 
     let command: string | undefined
-    if (ev.encodedCommand) {
+    if (encodedCommand) {
       try {
-        command = decodeSandboxedCommand(ev.encodedCommand)
+        command = decodeSandboxedCommand(encodedCommand)
       } catch {
         /* ignore */
       }
@@ -167,38 +134,62 @@ export function startLinuxSandboxViolationMonitor(
     const violation: SandboxViolationEvent = {
       line: `deny ${ev.syscall ?? 'syscall'} ${ev.path}`,
       command,
-      encodedCommand: ev.encodedCommand,
+      encodedCommand,
       timestamp: new Date(),
     }
     callback(violation)
+  }
+
+  let resolveReady: () => void
+  const ready = new Promise<void>(res => {
+    resolveReady = res
   })
 
-  proc.stderr?.on('data', (d: Buffer) => {
-    logForDebugging(`[Sandbox Linux Monitor] stderr: ${d.toString().trim()}`)
+  let observeSocketPath: string | undefined = sockPath
+
+  const server: Server = createServer(conn => {
+    let encodedCommand: string | undefined
+    const rl = createInterface({ input: conn })
+    rl.on('line', raw => {
+      if (!raw) return
+      let ev: ObserveEvent
+      try {
+        ev = JSON.parse(raw) as ObserveEvent
+      } catch {
+        return
+      }
+      // First line from each apply-seccomp instance is the encodedCommand
+      // header; subsequent lines may also carry it but the header is
+      // authoritative for this connection.
+      if (ev.encodedCommand && encodedCommand === undefined) {
+        encodedCommand = ev.encodedCommand
+      }
+      handleEvent(ev, encodedCommand ?? ev.encodedCommand)
+    })
+    conn.on('error', () => rl.close())
+    conn.on('close', () => rl.close())
   })
-  proc.on('error', err => {
+
+  server.on('error', err => {
     logForDebugging(
-      `[Sandbox Linux Monitor] failed to start supervisor: ${err.message}`,
+      `[Sandbox Linux Monitor] listen failed: ${err.message} - violation monitoring disabled`,
+      { level: 'warn' },
     )
-    proc = undefined
+    observeSocketPath = undefined
     resolveReady()
   })
-  proc.on('exit', code => {
-    logForDebugging(
-      `[Sandbox Linux Monitor] supervisor exited with code ${code}`,
-    )
-    proc = undefined
-    if (!isReady) resolveReady()
+  server.listen(sockPath, () => resolveReady())
+
+  const sockets = new Set<Socket>()
+  server.on('connection', s => {
+    sockets.add(s)
+    s.on('close', () => sockets.delete(s))
   })
 
   const stop = (): void => {
     logForDebugging('[Sandbox Linux Monitor] stopping')
-    rl.close()
-    try {
-      proc?.kill('SIGTERM')
-    } catch {
-      /* already dead */
-    }
+    for (const s of sockets) s.destroy()
+    server.close()
     try {
       rmSync(sockDir, { recursive: true, force: true })
     } catch {
@@ -206,5 +197,11 @@ export function startLinuxSandboxViolationMonitor(
     }
   }
 
-  return { observeSocketPath: sockPath, ready, stop }
+  return {
+    get observeSocketPath() {
+      return observeSocketPath
+    },
+    ready,
+    stop,
+  }
 }

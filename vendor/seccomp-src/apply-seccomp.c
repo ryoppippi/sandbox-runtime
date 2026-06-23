@@ -45,7 +45,10 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <poll.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -84,54 +87,111 @@
 #  define SRT_HAS_X32 0
 #endif
 
-/* ---- Optional passive observation filter -------------------------------
- * When SRT_OBSERVE_SOCK is set, install a second seccomp filter that traps
- * write-intent filesystem syscalls (and connect) to SECCOMP_RET_USER_NOTIF
- * and hand the listener fd to the supervisor over that unix socket. The
- * supervisor replies CONTINUE to every notification, so this never changes
- * the workload's behaviour — it only lets the parent record which paths a
- * sandboxed command tried to touch. Every failure path is non-fatal: log a
- * one-line JSON error on the socket if we managed to connect, then proceed
- * exactly as if SRT_OBSERVE_SOCK were unset. */
+/* ---- Optional passive observation filter ---------------------------------
+ *
+ * When SRT_OBSERVE_SOCK is set the worker installs a second seccomp filter
+ * that traps write-intent filesystem syscalls (and connect) to
+ * SECCOMP_RET_USER_NOTIF, then ships the listener fd to the OUTER STUB over
+ * a pre-fork socketpair. The outer stub is never under either filter, so it
+ * services every notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE — the
+ * workload's behaviour is unchanged — and writes one JSON line per
+ * observed call to the SRT_OBSERVE_SOCK unix socket (a Node net.Server).
+ *
+ * Paths are read from the workload's address space with process_vm_readv.
+ * That memory is ATTACKER-CONTROLLED and racy (the workload can rewrite the
+ * buffer between trap and read). bwrap's mount table is the only enforcement
+ * boundary; the path reported here is a HINT for diagnostics and must never
+ * gate a policy decision.
+ *
+ * Every failure path is fail-open: any error before the filter is installed
+ * disables observation and proceeds; any error after still drains the notify
+ * fd with CONTINUE so the workload cannot wedge. */
+
+#ifndef SECCOMP_IOCTL_NOTIF_RECV
+#  define SECCOMP_IOC_MAGIC '!'
+#  define SECCOMP_IOCTL_NOTIF_RECV     _IOWR(SECCOMP_IOC_MAGIC, 0, struct seccomp_notif)
+#  define SECCOMP_IOCTL_NOTIF_SEND     _IOWR(SECCOMP_IOC_MAGIC, 1, struct seccomp_notif_resp)
+#  define SECCOMP_IOCTL_NOTIF_ID_VALID _IOW (SECCOMP_IOC_MAGIC, 2, __u64)
+#endif
+#ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
+#  define SECCOMP_USER_NOTIF_FLAG_CONTINUE (1UL << 0)
+#endif
+#ifndef SECCOMP_GET_NOTIF_SIZES
+#  define SECCOMP_GET_NOTIF_SIZES 3
+#endif
+#ifndef __NR_pidfd_open
+#  define __NR_pidfd_open 434
+#endif
+#ifndef __NR_fchmodat2
+#  define __NR_fchmodat2 452
+#endif
 
 #define OBS_WRITE_MASK ((unsigned)(O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND))
+#define OBS_PATH_MAX 4096
+#define OBS_LINE_CAP (OBS_PATH_MAX * 2 + 256)
 
-static void observe_fail(int sock, const char *why) {
-    if (sock >= 0) {
-        char buf[256];
-        int n = snprintf(buf, sizeof(buf),
-                         "{\"observe_init_error\":\"%s: %s\"}\n",
-                         why, strerror(errno));
-        if (n > 0) (void)!write(sock, buf, (size_t)n);
-        close(sock);
-    }
+/* Single source of truth for the observed-syscall set. The BPF program and
+ * the supervisor's name/path-arg lookup are both derived from this table so
+ * they cannot drift. flags_arg >= 0 means the BPF gates the trap on
+ * args[flags_arg] & OBS_WRITE_MASK; -1 means always trap. path_arg == -2
+ * marks connect(2), which reads a sockaddr instead of a path. */
+struct observe_call {
+    int nr;
+    const char *name;
+    int8_t path_arg;
+    int8_t path2_arg;
+    int8_t flags_arg;
+};
+
+static const struct observe_call observe_calls[] = {
+    { __NR_openat,     "openat",     1, -1,  2 },
+#ifdef __NR_openat2
+    { __NR_openat2,    "openat2",    1, -1, -1 },
+#endif
+    { __NR_unlinkat,   "unlinkat",   1, -1, -1 },
+    { __NR_mkdirat,    "mkdirat",    1, -1, -1 },
+    { __NR_mknodat,    "mknodat",    1, -1, -1 },
+    { __NR_symlinkat,  "symlinkat",  2, -1, -1 },
+    { __NR_linkat,     "linkat",     1,  3, -1 },
+#ifdef __NR_renameat
+    { __NR_renameat,   "renameat",   1,  3, -1 },
+#endif
+    { __NR_renameat2,  "renameat2",  1,  3, -1 },
+    { __NR_fchmodat,   "fchmodat",   1, -1, -1 },
+    { __NR_fchmodat2,  "fchmodat2",  1, -1, -1 },
+    { __NR_fchownat,   "fchownat",   1, -1, -1 },
+    { __NR_utimensat,  "utimensat",  1, -1, -1 },
+    { __NR_connect,    "connect",   -2, -1, -1 },
+#ifdef __x86_64__
+    /* Legacy non-*at entry points: glibc/coreutils still call these directly
+     * on x86_64. aarch64 only ever had the *at forms. */
+    { __NR_open,       "open",       0, -1,  1 },
+    { __NR_creat,      "creat",      0, -1, -1 },
+    { __NR_unlink,     "unlink",     0, -1, -1 },
+    { __NR_rmdir,      "rmdir",      0, -1, -1 },
+    { __NR_rename,     "rename",     0,  1, -1 },
+    { __NR_link,       "link",       0,  1, -1 },
+    { __NR_symlink,    "symlink",    1, -1, -1 },
+    { __NR_mkdir,      "mkdir",      0, -1, -1 },
+    { __NR_mknod,      "mknod",      0, -1, -1 },
+    { __NR_truncate,   "truncate",   0, -1, -1 },
+    { __NR_chmod,      "chmod",      0, -1, -1 },
+    { __NR_chown,      "chown",      0, -1, -1 },
+    { __NR_lchown,     "lchown",     0, -1, -1 },
+    { __NR_utime,      "utime",      0, -1, -1 },
+    { __NR_utimes,     "utimes",     0, -1, -1 },
+#endif
+};
+static const int n_observe_calls = (int)(sizeof(observe_calls)/sizeof(observe_calls[0]));
+
+static const struct observe_call *find_observe_call(int nr) {
+    for (int i = 0; i < n_observe_calls; i++)
+        if (observe_calls[i].nr == nr) return &observe_calls[i];
+    return NULL;
 }
 
 static int build_observe_bpf(struct sock_filter *f, int cap) {
-    /* Syscalls that always trap. openat/open are handled separately so their
-     * flags argument can gate the trap; openat2 traps unconditionally because
-     * its flags live behind a userspace pointer the BPF program cannot read.
-     * x86_64 still has the legacy non-*at entry points and glibc/coreutils
-     * call them directly; aarch64 only ever had the *at forms. */
-    static const int trap_nrs[] = {
-#ifdef __NR_openat2
-        __NR_openat2,
-#endif
-        __NR_unlinkat, __NR_mkdirat, __NR_symlinkat, __NR_linkat,
-#ifdef __NR_renameat
-        __NR_renameat,
-#endif
-        __NR_renameat2, __NR_connect,
-#ifdef __x86_64__
-        __NR_creat, __NR_unlink, __NR_mkdir, __NR_rmdir, __NR_rename,
-        __NR_link, __NR_symlink, __NR_truncate, __NR_chmod,
-        __NR_chown, __NR_lchown,
-#endif
-    };
-    const int ntrap = (int)(sizeof(trap_nrs) / sizeof(trap_nrs[0]));
-
     int n = 0;
-    int allow_at, notify_at;
 #define EMIT(ins) do { if (n >= cap) return -1; f[n++] = (struct sock_filter)ins; } while (0)
 
     /* arch check */
@@ -148,91 +208,60 @@ static int build_observe_bpf(struct sock_filter *f, int cap) {
     EMIT(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000u, 0, 0));    /* jt→ALLOW */
 #endif
 
-    int j_trap[24];
-    for (int i = 0; i < ntrap; i++) {
-        j_trap[i] = n;
-        EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)trap_nrs[i], 0, 0)); /* jt→NOTIFY */
+    /* Always-trap syscalls (flags_arg < 0). */
+    int j_trap[64], ntrap = 0;
+    for (int i = 0; i < n_observe_calls; i++) {
+        if (observe_calls[i].flags_arg >= 0) continue;
+        j_trap[ntrap++] = n;
+        EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                      (unsigned)observe_calls[i].nr, 0, 0));         /* jt→NOTIFY */
     }
 
-    /* openat: trap only when flags (args[2]) carry write intent */
-    int j_openat = n;
-    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)__NR_openat, 0, 0)); /* jf→next */
-    EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-                  offsetof(struct seccomp_data, args[2])));
-    EMIT(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, OBS_WRITE_MASK));
-    int j_oat_flags = n;
-    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0));              /* jt→ALLOW jf→NOTIFY */
+    /* Flags-gated syscalls: trap only when args[flags_arg] & OBS_WRITE_MASK.
+     * Each gated syscall emits a 4-instruction block; jf of the JEQ chains to
+     * the next block, last chains to ALLOW. After the flags load the
+     * accumulator no longer holds nr, so a non-match must reload nr — handled
+     * by chaining JEQ jf directly past the load. */
+    struct { int jeq, jflags; } gated[4];
+    int ngated = 0;
+    for (int i = 0; i < n_observe_calls; i++) {
+        if (observe_calls[i].flags_arg < 0) continue;
+        gated[ngated].jeq = n;
+        EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                      (unsigned)observe_calls[i].nr, 0, 0));         /* jf→next gated / ALLOW */
+        EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                      offsetof(struct seccomp_data, args) +
+                      (size_t)observe_calls[i].flags_arg * sizeof(__u64)));
+        EMIT(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, OBS_WRITE_MASK));
+        gated[ngated].jflags = n;
+        EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0));          /* jt→ALLOW jf→NOTIFY */
+        ngated++;
+    }
 
-#ifdef __x86_64__
-    /* open: trap only when flags (args[1]) carry write intent */
-    int j_open = n;
-    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)__NR_open, 0, 0)); /* jf→ALLOW */
-    EMIT(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-                  offsetof(struct seccomp_data, args[1])));
-    EMIT(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, OBS_WRITE_MASK));
-    int j_o_flags = n;
-    EMIT(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0));              /* jt→ALLOW jf→NOTIFY */
-#endif
-
-    allow_at = n;
+    int allow_at = n;
     EMIT(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    notify_at = n;
+    int notify_at = n;
     EMIT(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF));
 
 #define TO(idx, tgt) ((unsigned char)((tgt) - (idx) - 1))
-    f[j_arch].jf  = TO(j_arch, allow_at);
+    f[j_arch].jf = TO(j_arch, allow_at);
 #if SRT_HAS_X32
-    f[j_x32].jt   = TO(j_x32, allow_at);
+    f[j_x32].jt  = TO(j_x32, allow_at);
 #endif
     for (int i = 0; i < ntrap; i++) f[j_trap[i]].jt = TO(j_trap[i], notify_at);
-#ifdef __x86_64__
-    f[j_openat].jf    = TO(j_openat, j_open);
-    f[j_oat_flags].jt = TO(j_oat_flags, allow_at);
-    f[j_oat_flags].jf = TO(j_oat_flags, notify_at);
-    f[j_open].jf      = TO(j_open, allow_at);
-    f[j_o_flags].jt   = TO(j_o_flags, allow_at);
-    f[j_o_flags].jf   = TO(j_o_flags, notify_at);
-#else
-    f[j_openat].jf    = TO(j_openat, allow_at);
-    f[j_oat_flags].jt = TO(j_oat_flags, allow_at);
-    f[j_oat_flags].jf = TO(j_oat_flags, notify_at);
-#endif
+    for (int i = 0; i < ngated; i++) {
+        int next = (i + 1 < ngated) ? gated[i + 1].jeq : allow_at;
+        f[gated[i].jeq].jf    = TO(gated[i].jeq, next);
+        f[gated[i].jflags].jt = TO(gated[i].jflags, allow_at);
+        f[gated[i].jflags].jf = TO(gated[i].jflags, notify_at);
+    }
 #undef TO
 #undef EMIT
     return n;
 }
 
-static void install_observe_filter(void) {
-    const char *path = getenv("SRT_OBSERVE_SOCK");
-    if (!path || !*path || SRT_AUDIT_ARCH == 0) return;
-    unsetenv("SRT_OBSERVE_SOCK");   /* don't leak into the workload */
-
-    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (sock < 0) { observe_fail(-1, "socket"); return; }
-
-    struct sockaddr_un sa = { .sun_family = AF_UNIX };
-    if (strlen(path) >= sizeof(sa.sun_path)) { observe_fail(sock, "path"); return; }
-    strcpy(sa.sun_path, path);
-    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        observe_fail(sock, "connect"); return;
-    }
-
-    const char *enc = getenv("SRT_ENCODED_CMD");
-    if (enc && *enc) {
-        char hdr[768];
-        int n = snprintf(hdr, sizeof(hdr), "{\"encodedCommand\":\"%.700s\"}\n", enc);
-        if (n > 0) (void)!write(sock, hdr, (size_t)n);
-    }
-
-    struct sock_filter filt[48];
-    int len = build_observe_bpf(filt, 48);
-    if (len < 0) { observe_fail(sock, "bpf"); return; }
-    struct sock_fprog prog = { .len = (unsigned short)len, .filter = filt };
-
-    int nfd = (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
-                           SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
-    if (nfd < 0) { observe_fail(sock, "seccomp"); return; }
-
+/* Send a single fd over a connected stream socket via SCM_RIGHTS. */
+static int send_fd(int sock, int fd) {
     char dummy = 'F';
     union { struct cmsghdr align; char ctl[CMSG_SPACE(sizeof(int))]; } u;
     memset(&u, 0, sizeof(u));
@@ -242,10 +271,222 @@ static void install_observe_filter(void) {
     struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
     c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
     c->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(c), &nfd, sizeof(int));
-    if (sendmsg(sock, &msg, 0) < 0) observe_fail(sock, "sendmsg");
-    else close(sock);
-    close(nfd);   /* supervisor now holds the only reference */
+    memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    return sendmsg(sock, &msg, 0) < 0 ? -1 : 0;
+}
+
+/* Receive at most one fd. Returns the fd, or -1 if the peer sent no fd or
+ * closed (worker declined to install the filter). */
+static int recv_fd(int sock) {
+    char dummy;
+    union { struct cmsghdr align; char ctl[CMSG_SPACE(sizeof(int))]; } u;
+    memset(&u, 0, sizeof(u));
+    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+                          .msg_control = u.ctl, .msg_controllen = sizeof(u.ctl) };
+    ssize_t r = recvmsg(sock, &msg, 0);
+    if (r <= 0) return -1;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
+            c->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            int fd; memcpy(&fd, CMSG_DATA(c), sizeof(int));
+            return fd;
+        }
+    }
+    return -1;
+}
+
+/* Called in the WORKER after PR_SET_NO_NEW_PRIVS. Installs the USER_NOTIF
+ * filter and ships the listener fd to the outer stub over the pre-fork
+ * socketpair. Never fatal: any pre-filter failure sends a no-fd marker and
+ * returns; any post-filter failure raw-writes a diagnostic and _exit()s
+ * (continuing would either wedge on the next matched syscall or leave a
+ * filter with no listener, which makes matched syscalls fail ENOSYS).
+ *
+ * Audited syscalls between the seccomp() return and execve():
+ *   sendmsg, close, close, prctl(PR_SET_SECCOMP), execve
+ * None are in the observe match set (write-intent fs / connect) and none are
+ * in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
+ * trap on itself before exec. perror()/snprintf() are deliberately avoided
+ * post-filter to keep this set closed. */
+static void install_observe_filter(int sp_fd) {
+    if (sp_fd < 0) return;
+
+    struct sock_filter filt[80];
+    int len = build_observe_bpf(filt, (int)(sizeof(filt)/sizeof(filt[0])));
+    if (len < 0) { (void)!write(sp_fd, "E", 1); close(sp_fd); return; }
+    struct sock_fprog prog = { .len = (unsigned short)len, .filter = filt };
+
+    int nfd = (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                           SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+    if (nfd < 0) {
+        /* EINVAL: kernel <5.0. EBUSY: another listener already installed.
+         * Either way, no filter is active — fail open. */
+        (void)!write(sp_fd, "E", 1);
+        close(sp_fd);
+        return;
+    }
+
+    /* --- filter is now live --- */
+    if (send_fd(sp_fd, nfd) < 0) {
+        static const char msg[] = "apply-seccomp: observe sendmsg failed\n";
+        (void)!write(2, msg, sizeof(msg) - 1);
+        _exit(125);
+    }
+    close(sp_fd);
+    close(nfd);   /* outer stub now holds the only reference */
+}
+
+/* ---- Outer-stub supervisor --------------------------------------------- */
+
+static void json_escape_into(char *dst, size_t dstcap, const char *src, size_t srclen) {
+    static const char hex[] = "0123456789abcdef";
+    size_t o = 0;
+    for (size_t i = 0; i < srclen && o + 7 < dstcap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') { dst[o++]='\\'; dst[o++]=(char)c; }
+        else if (c < 0x20)         { dst[o++]='\\'; dst[o++]='u'; dst[o++]='0'; dst[o++]='0';
+                                     dst[o++]=hex[c>>4]; dst[o++]=hex[c&0xf]; }
+        else                       { dst[o++]=(char)c; }
+    }
+    dst[o] = '\0';
+}
+
+static ssize_t read_remote_bytes(pid_t pid, unsigned long addr, char *dst, size_t cap) {
+    if (addr == 0) return -1;
+    struct iovec local  = { .iov_base = dst, .iov_len = cap };
+    struct iovec remote = { .iov_base = (void *)addr, .iov_len = cap };
+    return process_vm_readv(pid, &local, 1, &remote, 1, 0);
+}
+
+static ssize_t read_remote_cstr(pid_t pid, unsigned long addr, char *dst, size_t cap) {
+    ssize_t r = read_remote_bytes(pid, addr, dst, cap);
+    if (r < 0 && errno == EFAULT) {
+        /* String may sit at the tail of a mapping. */
+        size_t first = 4096 - (addr & 4095);
+        if (first > cap) first = cap;
+        r = read_remote_bytes(pid, addr, dst, first);
+    }
+    if (r <= 0) return -1;
+    char *nul = memchr(dst, '\0', (size_t)r);
+    return nul ? (nul - dst) : r;
+}
+
+static void emit_event(int out, const struct observe_call *oc, int nr, pid_t pid,
+                       const char *path, size_t pathlen, const char *enc) {
+    if (out < 0) return;
+    char esc[OBS_LINE_CAP];
+    json_escape_into(esc, sizeof(esc), path, pathlen);
+    char line[OBS_LINE_CAP + 512];
+    int n;
+    if (enc && *enc) {
+        n = snprintf(line, sizeof(line),
+                     "{\"nr\":%d,\"syscall\":\"%s\",\"pid\":%d,\"path\":\"%s\","
+                     "\"encodedCommand\":\"%s\"}\n",
+                     nr, oc ? oc->name : "syscall", (int)pid, esc, enc);
+    } else {
+        n = snprintf(line, sizeof(line),
+                     "{\"nr\":%d,\"syscall\":\"%s\",\"pid\":%d,\"path\":\"%s\"}\n",
+                     nr, oc ? oc->name : "syscall", (int)pid, esc);
+    }
+    if (n > 0) (void)!write(out, line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line)-1));
+}
+
+static int connect_observe_sock(const char *path) {
+    if (!path || !*path) return -1;
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return -1;
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof(sa.sun_path)) {
+        close(s); errno = ENAMETOOLONG; return -1;
+    }
+    strcpy(sa.sun_path, path);
+    if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(s); return -1; }
+    /* Don't take SIGPIPE if Node drops the connection mid-run. */
+    signal(SIGPIPE, SIG_IGN);
+    return s;
+}
+
+/* Service the notify fd until the inner-init child exits. Runs in the OUTER
+ * STUB, which never installed either seccomp filter. Always replies CONTINUE,
+ * even when out_sock < 0, so a missing listener never wedges the workload. */
+static void supervise(pid_t child, int notify_fd, int out_sock, const char *enc) {
+    struct seccomp_notif_sizes sz;
+    if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sz) < 0) {
+        sz.seccomp_notif = sizeof(struct seccomp_notif);
+        sz.seccomp_notif_resp = sizeof(struct seccomp_notif_resp);
+    }
+    struct seccomp_notif *req = calloc(1, sz.seccomp_notif);
+    struct seccomp_notif_resp *resp = calloc(1, sz.seccomp_notif_resp);
+    char *pbuf = malloc(OBS_PATH_MAX);
+    if (!req || !resp || !pbuf) return;
+
+    int pidfd = (int)syscall(__NR_pidfd_open, child, 0);
+
+    struct pollfd pfds[2];
+    pfds[0].fd = notify_fd; pfds[0].events = POLLIN;
+    pfds[1].fd = pidfd;     pfds[1].events = POLLIN;
+    nfds_t nfds = pidfd >= 0 ? 2 : 1;
+    int tmo = pidfd >= 0 ? -1 : 200;
+
+    for (;;) {
+        int pr = poll(pfds, nfds, tmo);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+
+        if (pfds[0].revents & POLLIN) {
+            memset(req, 0, sz.seccomp_notif);
+            if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, req) == 0) {
+                const struct observe_call *oc = find_observe_call(req->data.nr);
+                if (out_sock >= 0 &&
+                    ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req->id) == 0) {
+                    if (oc && oc->path_arg == -2) {
+                        struct sockaddr_un su;
+                        ssize_t rl = read_remote_bytes(req->pid,
+                                       (unsigned long)req->data.args[1],
+                                       (char *)&su, sizeof(su));
+                        if (rl >= (ssize_t)offsetof(struct sockaddr_un, sun_path) + 1 &&
+                            su.sun_family == AF_UNIX) {
+                            size_t cap = (size_t)rl - offsetof(struct sockaddr_un, sun_path);
+                            if (cap > sizeof(su.sun_path)) cap = sizeof(su.sun_path);
+                            size_t l = strnlen(su.sun_path, cap);
+                            emit_event(out_sock, oc, req->data.nr, req->pid,
+                                       su.sun_path, l, enc);
+                        }
+                    } else if (oc) {
+                        int idxs[2] = { oc->path_arg, oc->path2_arg };
+                        for (int k = 0; k < 2; k++) {
+                            if (idxs[k] < 0) continue;
+                            ssize_t l = read_remote_cstr(req->pid,
+                                          (unsigned long)req->data.args[idxs[k]],
+                                          pbuf, OBS_PATH_MAX);
+                            if (l > 0) emit_event(out_sock, oc, req->data.nr,
+                                                  req->pid, pbuf, (size_t)l, enc);
+                        }
+                    }
+                }
+                memset(resp, 0, sz.seccomp_notif_resp);
+                resp->id = req->id;
+                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                (void)ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, resp);
+            } else if (errno != EINTR && errno != ENOENT) {
+                break;
+            }
+        }
+        /* All filtered tasks gone → notify fd reports EOF. */
+        if (pfds[0].revents & (POLLHUP | POLLERR)) break;
+
+        if (pidfd >= 0) {
+            if (pfds[1].revents) break;
+        } else {
+            /* WNOWAIT: leave the zombie for the caller's waitpid. */
+            siginfo_t si = {0};
+            if (waitid(P_PID, (id_t)child, &si, WEXITED|WNOHANG|WNOWAIT) == 0 &&
+                si.si_pid == child) break;
+        }
+    }
+
+    if (pidfd >= 0) close(pidfd);
+    free(req); free(resp); free(pbuf);
 }
 
 static void die(const char *msg) {
@@ -304,31 +545,39 @@ static void install_forwarders(pid_t target) {
 
 /*
  * Wait for `main_child`, reaping any other children that exit first.
- * Returns as soon as `main_child` terminates — the caller then _exit()s,
- * which as PID 1 tears down the namespace and SIGKILLs any stragglers.
- * Returns an exit(3)-style status: exit code, or 128+signal.
+ * Returns the raw wait status as soon as `main_child` terminates — the
+ * caller then exit_like_wstatus()s, which as PID 1 tears down the namespace
+ * and SIGKILLs any stragglers.
  */
 static int reap_until(pid_t main_child) {
     int status = 0;
     for (;;) {
         pid_t r = waitpid(-1, &status, 0);
         if (r < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return 1;  /* ECHILD without seeing main_child — shouldn't happen. */
+            if (errno == EINTR) continue;
+            return W_EXITCODE(1, 0);  /* ECHILD without seeing main_child */
         }
-        if (r == main_child) {
-            if (WIFEXITED(status)) {
-                return WEXITSTATUS(status);
-            }
-            if (WIFSIGNALED(status)) {
-                return 128 + WTERMSIG(status);
-            }
-            return 1;
-        }
+        if (r == main_child) return status;
         /* Reaped an orphan that died before main_child; keep waiting. */
     }
+}
+
+/* Mirror the child's termination so OUR parent sees the same WIFSIGNALED /
+ * WEXITSTATUS it would have seen had it spawned the workload directly
+ * (tini/dumb-init semantics). For a signal death, reset the disposition and
+ * re-raise; if that returns — it does for the inner init, since the kernel
+ * never delivers default-fatal signals to a namespace's PID 1 — fall through
+ * to the 128+sig convention. The outer stub then decodes 128+sig back into a
+ * real signal and re-raises so bwrap/shell observe the genuine signal. */
+static void exit_like_wstatus(int ws) __attribute__((noreturn));
+static void exit_like_wstatus(int ws) {
+    if (WIFSIGNALED(ws)) {
+        int sig = WTERMSIG(ws);
+        signal(sig, SIG_DFL);
+        raise(sig);
+        _exit(128 + sig);
+    }
+    _exit(WIFEXITED(ws) ? WEXITSTATUS(ws) : 1);
 }
 
 int main(int argc, char *argv[]) {
@@ -345,6 +594,16 @@ int main(int argc, char *argv[]) {
         .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
         .filter = (struct sock_filter *)unix_block_bpf,
     };
+
+    /* ---- Optional observation: pre-fork setup --------------------------- */
+    const char *observe_sock = getenv("SRT_OBSERVE_SOCK");
+    const char *encoded_cmd  = getenv("SRT_ENCODED_CMD");
+    int sp[2] = { -1, -1 };
+    if (observe_sock && *observe_sock && SRT_AUDIT_ARCH != 0) {
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) < 0) {
+            sp[0] = sp[1] = -1;   /* fail open */
+        }
+    }
 
     /* ---- New PID + mount namespaces. Children (not us) enter the PID ns. ----
      *
@@ -395,9 +654,34 @@ int main(int argc, char *argv[]) {
     }
 
     if (child > 0) {
-        /* Outer stub: still in bwrap's PID namespace. Forward signals and
-         * wait so the caller sees the real exit status. */
+        /* Outer stub: still in bwrap's PID namespace. Forward signals,
+         * optionally service the USER_NOTIF observation fd, then relay the
+         * child's exit status. Never under either seccomp filter. */
+        if (sp[1] >= 0) close(sp[1]);
         install_forwarders(child);
+
+        if (sp[0] >= 0) {
+            int notify_fd = recv_fd(sp[0]);
+            close(sp[0]);
+            if (notify_fd >= 0) {
+                int out = connect_observe_sock(observe_sock);
+                if (out < 0) {
+                    char buf[256];
+                    int n = snprintf(buf, sizeof(buf),
+                        "{\"observe_init_error\":\"connect %s: %s\"}\n",
+                        observe_sock, strerror(errno));
+                    (void)!write(2, buf, (size_t)n);
+                } else if (encoded_cmd && *encoded_cmd) {
+                    char hdr[768];
+                    int n = snprintf(hdr, sizeof(hdr),
+                        "{\"encodedCommand\":\"%.700s\"}\n", encoded_cmd);
+                    if (n > 0) (void)!write(out, hdr, (size_t)n);
+                }
+                supervise(child, notify_fd, out, encoded_cmd);
+                if (out >= 0) close(out);
+                close(notify_fd);
+            }
+        }
 
         int status;
         for (;;) {
@@ -406,9 +690,22 @@ int main(int argc, char *argv[]) {
             if (r < 0) die("apply-seccomp: waitpid");
             break;
         }
-        if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        /* Inner init is namespace PID 1 and cannot re-raise, so it encodes a
+         * signal death as exit(128+sig). Decode and re-raise here so the
+         * grandparent sees WIFSIGNALED. */
+        if (WIFEXITED(status)) {
+            int ec = WEXITSTATUS(status);
+            if (ec > 128 && ec < 128 + NSIG) {
+                signal(ec - 128, SIG_DFL);
+                raise(ec - 128);
+            }
+            _exit(ec);
+        }
+        exit_like_wstatus(status);
     }
+
+    /* Child side: drop the stub's socketpair end. */
+    if (sp[0] >= 0) close(sp[0]);
 
     /* ================================================================
      * Inner init — PID 1 in the nested PID namespace.
@@ -450,19 +747,22 @@ int main(int argc, char *argv[]) {
         /* Inner init: reap everything, exit with the worker's status.
          * When PID 1 exits the kernel tears down the whole namespace.
          * PID 1 drops signals without handlers, so install forwarders. */
+        if (sp[1] >= 0) close(sp[1]);
         install_forwarders(worker);
-        _exit(reap_until(worker));
+        exit_like_wstatus(reap_until(worker));
     }
 
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
+    unsetenv("SRT_OBSERVE_SOCK");
+    unsetenv("SRT_ENCODED_CMD");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }
-    /* Best-effort: hand a USER_NOTIF listener to the supervisor so it can
-     * record write-intent paths. Runs before the unix-block filter so the
-     * AF_UNIX connect() is still permitted, and before exec so only the
-     * workload is observed. Never fatal. */
-    install_observe_filter();
+    /* Best-effort: install the USER_NOTIF observation filter and hand its
+     * listener fd to the outer stub over the pre-fork socketpair. Runs after
+     * NO_NEW_PRIVS (required) and before the unix-block filter / exec so only
+     * the workload is observed. */
+    install_observe_filter(sp[1]);
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0) {
         die("apply-seccomp: prctl(PR_SET_SECCOMP)");
     }
