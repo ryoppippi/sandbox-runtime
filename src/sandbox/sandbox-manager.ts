@@ -687,6 +687,7 @@ function getCredentialRestrictions(
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
   // entries are skipped (same posture as an unset masked env var).
+  const files = credentials.files ?? []
   const maskedFileBinds = buildMaskedFileBinds(
     files,
     allowedDomains ?? [],
