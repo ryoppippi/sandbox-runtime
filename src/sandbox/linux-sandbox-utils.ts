@@ -1377,7 +1377,12 @@ export async function wrapCommandWithSandboxLinux(
 
         // Bind both sockets into the sandbox
         bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        // When the mux serves both protocols, socksSocketPath is the same
+        // file as httpSocketPath; bwrap rejects a duplicate --bind of the
+        // same source→target.
+        if (socksSocketPath !== httpSocketPath) {
+          bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        }
 
         // Add proxy environment variables
         // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
