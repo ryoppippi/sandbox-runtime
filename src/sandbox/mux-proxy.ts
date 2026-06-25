@@ -114,16 +114,19 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
       ? connect(backendSocketPath)
       : connect(backendTcpPort!, '127.0.0.1')
     upstream.on('error', err => {
-      // Surface as a 502 with the error text so callers (and CI logs) see
+      // Surface a 502 with the errno code so callers (and CI logs) can tell
       // *why* the backend was unreachable instead of an opaque empty-reply.
-      // The client may already have bytes in flight (they spoke HTTP to get
-      // here), so this isn't a perfectly-formed HTTP exchange — but a 502
-      // line beats a silent close for diagnostics.
-      const msg = `mux: HTTP backend dial failed: ${(err as Error).message}`
-      logForDebugging(msg, { level: 'error' })
+      // Full error (including path) goes to debug logging only — the client
+      // is our own sandboxed child, but there's no need to echo host paths.
+      const code = (err as NodeJS.ErrnoException).code ?? 'ERR'
+      logForDebugging(
+        `mux: HTTP backend dial failed: ${(err as Error).message}`,
+        { level: 'error' },
+      )
       if (!client.destroyed) {
         client.end(
-          `HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n${msg}\n`,
+          `HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n` +
+            `mux backend dial failed (${code})\n`,
         )
       }
     })
