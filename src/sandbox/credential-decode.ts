@@ -3,9 +3,12 @@
  * `credentials.files` entry). Currently JWT only.
  *
  * Pure helpers: the default extraction pattern for finding JWT candidates
- * in a file, and the verification predicate that confirms a candidate
- * actually is a JWT before it gets masked.
+ * in a file, the verification predicate that confirms a candidate actually
+ * is a JWT before it gets masked, and the minting of a JWT-shaped fake to
+ * stand in for the real token inside the sandbox.
  */
+
+import { SENTINEL_PREFIX } from './credential-sentinel.js'
 
 /**
  * Default `extract` pattern for `decode: "jwt"` entries.
@@ -45,4 +48,39 @@ export function verifyJwt(candidate: string): boolean {
     return false
   }
   return decodeSegment(parts[1]!) !== undefined
+}
+
+/**
+ * Fixed far-future `exp` claim for fake JWTs (2286-11-20). A constant, not
+ * an offset from now, so the fake is fully deterministic given the uuid.
+ */
+const FAKE_JWT_EXP = 9999999999
+
+/** Fixed signature filler: base64url("srt-fake"). Never a valid signature. */
+const FAKE_JWT_SIGNATURE = 'c3J0LWZha2U'
+
+function base64url(s: string): string {
+  return Buffer.from(s, 'utf8').toString('base64url')
+}
+
+/**
+ * Mint a structurally valid fake JWT carrying the sentinel identity
+ * `fake_value_<uuid>` in its `sub` claim. Deterministic given `uuid`.
+ *
+ * The fake is parseable by client-side JWT handling (three segments, JSON
+ * header/payload, far-future `exp`), so a tool inside the sandbox that
+ * inspects the token before sending it doesn't break. The header says
+ * `alg: HS256` — NOT `alg: none` — deliberately: misconfigured validators
+ * accept `alg: none` tokens as valid, whereas an HS256 header forces every
+ * validator to attempt signature verification and reject the garbage
+ * signature. So if the fake ever reaches a verifier unswapped (e.g. sent
+ * to a non-injectHosts destination, the designed fail-closed pass-through),
+ * it is cryptographically rejected.
+ */
+export function mintFakeJwt(uuid: string): string {
+  const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
+  const payload = base64url(
+    JSON.stringify({ sub: SENTINEL_PREFIX + uuid, exp: FAKE_JWT_EXP }),
+  )
+  return `${header}.${payload}.${FAKE_JWT_SIGNATURE}`
 }
