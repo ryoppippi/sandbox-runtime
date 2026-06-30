@@ -485,22 +485,6 @@ export const RipgrepConfigSchema = z.object({
  * must agree with.
  */
 export const WindowsConfigSchema = z.object({
-  groupName: z
-    .string()
-    .min(1)
-    .default('sandbox-runtime-net')
-    .describe(
-      'Discriminator group name. Must match the group created at install ' +
-        'time. Ignored if groupSid is set.',
-    ),
-  groupSid: z
-    .string()
-    .regex(/^S-1-/, 'must be an S-1-… SID string')
-    .optional()
-    .describe(
-      'Discriminator group SID. Overrides groupName lookup — use for ' +
-        'domain groups or where name resolution is unreliable.',
-    ),
   wfpSublayerGuid: z
     .string()
     .uuid()
@@ -510,16 +494,6 @@ export const WindowsConfigSchema = z.object({
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
     ),
-  asSandboxUser: z
-    .boolean()
-    .default(false)
-    .describe(
-      'Run sandboxed commands as the dedicated `srt-sandbox` local user ' +
-        '(two-hop launch via CreateProcessWithLogonW) instead of the ' +
-        'same-user deny-only-group token. Requires `srt-win install` to ' +
-        'have provisioned the user. Opt-in while the separate-user path ' +
-        'stabilises; the same-user path is unchanged when false.',
-    ),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
     .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
@@ -528,7 +502,7 @@ export const WindowsConfigSchema = z.object({
     .optional()
     .describe(
       'Inclusive [low, high] port range the JS http/socks proxies bind ' +
-        'inside. MUST match the range passed to `srt-win wfp install ' +
+        'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
@@ -625,7 +599,7 @@ export const SandboxRuntimeConfigSchema = z
           'When set, this path is used directly instead of resolving "socat" via PATH.',
       ),
     windows: WindowsConfigSchema.optional().describe(
-      'Windows-specific settings (group, WFP sublayer, proxy port range).',
+      'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
   })
   .superRefine((cfg, ctx) => {
