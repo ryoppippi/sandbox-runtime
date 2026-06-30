@@ -28,6 +28,7 @@ import {
   SentinelRegistry,
   SENTINEL_PREFIX,
 } from '../../src/sandbox/credential-sentinel.js'
+import { verifyJwt } from '../../src/sandbox/credential-decode.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
@@ -393,6 +394,195 @@ describe('buildMaskedFileBinds', () => {
     expect(msg).toContain('UNPROTECTED')
     expect(msg).toContain(HOSTS_YML)
     expect(msg).toContain('no_such_key: (\\S+)')
+    warnSpy.mockRestore()
+    store.dispose()
+  })
+})
+
+describe('buildMaskedFileBinds decode: "jwt"', () => {
+  const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
+
+  // Real-shaped JWTs: HS256 header, JSON payload, garbage signature.
+  const REAL_JWT =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+    b64u('{"sub":"1234567890","name":"John Doe","iat":1516239022}') +
+    '.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+  const REAL_JWT_2 =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+    b64u('{"sub":"other","iat":1516239022}') +
+    '.c2lnbmF0dXJl'
+  // Matches the default eyJ-triple pattern but is not a JWT: the first
+  // segment decodes to truncated (invalid) JSON.
+  const PSEUDO_JWT = `${b64u('{"oops')}.${b64u('{}')}.c2ln`
+
+  const DECODE_DIR = join(tmpdir(), 'srt-credmask-decode-' + Date.now())
+
+  beforeAll(() => {
+    mkdirSync(DECODE_DIR, { recursive: true })
+  })
+
+  afterAll(() => {
+    rmSync(DECODE_DIR, { recursive: true, force: true })
+  })
+
+  test('default pattern: a JWT in a JSON credentials file becomes a parseable fake JWT', () => {
+    const file = join(DECODE_DIR, 'credentials.json')
+    writeFileSync(file, `{"access_token":"${REAL_JWT}","note":"keep"}`)
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [{ path: file, mode: 'mask', decode: 'jwt' }],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    expect(fake).not.toContain(REAL_JWT)
+    // Structure preserved around the swapped span.
+    expect(fake).toContain('"note":"keep"')
+    const fakeToken = fake.match(/"access_token":"([^"]+)"/)![1]!
+
+    // The fake IS a parseable JWT: three segments, JSON header/payload.
+    expect(verifyJwt(fakeToken)).toBe(true)
+    const [h, p, sig] = fakeToken.split('.')
+    const header = JSON.parse(
+      Buffer.from(h!, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>
+    // HS256 + garbage signature, never alg:none — see mintFakeJwt.
+    expect(header).toEqual({ alg: 'HS256', typ: 'JWT' })
+    expect(sig).toBe('c3J0LWZha2U')
+    const payload = JSON.parse(
+      Buffer.from(p!, 'base64url').toString('utf8'),
+    ) as { sub: string }
+    expect(payload.sub).toContain(SENTINEL_PREFIX)
+
+    // Registry roundtrip: the full fake JWT is the sentinel key.
+    expect(reg.lookupReal(fakeToken)).toBe(REAL_JWT)
+    store.dispose()
+  })
+
+  test('a regex-matched but non-JWT candidate is left untouched', () => {
+    const file = join(DECODE_DIR, 'mixed')
+    writeFileSync(file, `good: ${REAL_JWT}\nblob: ${PSEUDO_JWT}\n`)
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [{ path: file, mode: 'mask', decode: 'jwt' }],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    // The real JWT is masked; the over-matched blob is preserved as-is
+    // (it is not a JWT, so there is nothing to protect).
+    expect(fake).not.toContain(REAL_JWT)
+    expect(fake).toContain(`blob: ${PSEUDO_JWT}\n`)
+    expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('all candidates failing verification → fail-open with warning', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const file = join(DECODE_DIR, 'only-blob')
+    writeFileSync(file, `blob: ${PSEUDO_JWT}\n`)
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [{ path: file, mode: 'mask', decode: 'jwt' }],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(0)
+    expect(reg.size).toBe(0)
+    expect(store.dirPath).toBeUndefined()
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    const msg = warnSpy.mock.calls[0]![0] as string
+    expect(msg).toContain('UNPROTECTED')
+    expect(msg).toContain(file)
+    expect(msg).toContain('JWT')
+    warnSpy.mockRestore()
+    store.dispose()
+  })
+
+  test('no candidate matching at all → fail-open with warning', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const file = join(DECODE_DIR, 'no-jwt')
+    writeFileSync(file, 'just some plain text\n')
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [{ path: file, mode: 'mask', decode: 'jwt' }],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(0)
+    expect(reg.size).toBe(0)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(warnSpy.mock.calls[0]![0] as string).toContain('UNPROTECTED')
+    warnSpy.mockRestore()
+    store.dispose()
+  })
+
+  test('explicit extract wins: only its captures are candidates, verification still applies', () => {
+    const file = join(DECODE_DIR, 'tokens.yml')
+    writeFileSync(
+      file,
+      `id_token: ${REAL_JWT}\nother_jwt: ${REAL_JWT_2}\nblob: x\n`,
+    )
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [
+        {
+          path: file,
+          mode: 'mask',
+          extract: 'id_token:\\s*(\\S+)',
+          decode: 'jwt',
+        },
+      ],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    // The author's pattern is the candidate source: the other JWT is NOT
+    // masked even though the default pattern would have found it.
+    expect(fake).not.toContain(`id_token: ${REAL_JWT}`)
+    expect(fake).toContain(`other_jwt: ${REAL_JWT_2}\n`)
+    const fakeToken = fake.match(/id_token: (\S+)/)![1]!
+    expect(verifyJwt(fakeToken)).toBe(true)
+    expect(reg.lookupReal(fakeToken)).toBe(REAL_JWT)
+    expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('explicit extract capturing a non-JWT with decode → fail-open with warning', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const file = join(DECODE_DIR, 'not-a-jwt.yml')
+    writeFileSync(file, 'id_token: opaque-session-cookie\n')
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [
+        {
+          path: file,
+          mode: 'mask',
+          extract: 'id_token:\\s*(\\S+)',
+          decode: 'jwt',
+        },
+      ],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(0)
+    expect(reg.size).toBe(0)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
     warnSpy.mockRestore()
     store.dispose()
   })
@@ -1090,3 +1280,130 @@ describe.if(isLinux)(
     }, 20000)
   },
 )
+
+/**
+ * End-to-end JWT decode masking: a token file holds a JWT; inside the
+ * sandbox the tool reads a structurally valid FAKE JWT (parseable header,
+ * payload, exp); sending it through the manager proxy delivers the REAL
+ * JWT to the injectHost, while a non-injectHost receives the fake.
+ */
+describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-jwt-e2e-' + Date.now())
+  const JWT_FILE = join(TEST_DIR, 'id-token')
+  const HOST_A = 'localhost'
+  const HOST_B = 'localtest.me'
+
+  const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
+  const REAL_JWT =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+    b64u('{"sub":"e2e-user","iat":1516239022}') +
+    '.ZTJlLXJlYWwtc2lnbmF0dXJl'
+
+  let upstream: Server
+  let upstreamPort: number
+  let lastHeaders: IncomingHttpHeaders | undefined
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(JWT_FILE, `${REAL_JWT}\n`)
+
+    upstream = createHttpServer((req, res) => {
+      lastHeaders = req.headers
+      res.writeHead(200)
+      res.end('ok')
+    })
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', () => r()))
+    upstreamPort = (upstream.address() as AddressInfo).port
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [HOST_A, HOST_B], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: JWT_FILE,
+            mode: 'mask',
+            decode: 'jwt',
+            injectHosts: [HOST_A],
+          },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    await new Promise<void>(r => upstream.close(() => r()))
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  async function curlViaManagerProxy(
+    url: string,
+    bearer: string,
+    resolve?: string,
+  ): Promise<number> {
+    const proxyPort = SandboxManager.getProxyPort()!
+    const authToken = SandboxManager.getProxyAuthToken()!
+    const args = [
+      '-sS',
+      '--max-time',
+      '10',
+      '--proxy',
+      `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      '-H',
+      `Authorization: Bearer ${bearer}`,
+    ]
+    if (resolve) args.push('--resolve', resolve)
+    args.push(url)
+    const child = spawn('curl', args)
+    child.stdout.on('data', () => {})
+    child.stderr.on('data', () => {})
+    return new Promise(r => child.on('close', code => r(code ?? 1)))
+  }
+
+  test('cat → fake JWT inside; proxy delivers the real JWT to the injectHost', async () => {
+    // bwrap leg: the sandboxed read returns a structurally valid fake.
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${JWT_FILE}`)
+    expect(wrapped).not.toContain(REAL_JWT)
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(result.status).toBe(0)
+    const fakeJwt = result.stdout.trim()
+    expect(fakeJwt).not.toBe(REAL_JWT)
+    expect(verifyJwt(fakeJwt)).toBe(true)
+
+    // Proxy leg: the fake sent as a bearer token reaches the injectHost
+    // as the REAL JWT.
+    lastHeaders = undefined
+    const exit = await curlViaManagerProxy(
+      `http://${HOST_A}:${upstreamPort}/`,
+      fakeJwt,
+    )
+    expect(exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_JWT}`)
+  }, 20000)
+
+  test('a non-injectHost destination receives the fake JWT unchanged', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${JWT_FILE}`)
+    const fakeJwt = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    }).stdout.trim()
+
+    lastHeaders = undefined
+    const exit = await curlViaManagerProxy(
+      `http://${HOST_B}:${upstreamPort}/`,
+      fakeJwt,
+      `${HOST_B}:${upstreamPort}:127.0.0.1`,
+    )
+    expect(exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
+    expect(lastHeaders?.authorization).not.toContain(REAL_JWT)
+  }, 20000)
+})
