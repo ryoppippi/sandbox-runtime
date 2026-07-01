@@ -190,6 +190,13 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * (default `"warn"` — the file is left readable as-is and a stderr
  * warning is emitted).
  *
+ * `maskDuplicates: true` (only meaningful with `extract`) additionally
+ * replaces every verbatim occurrence of each captured value *outside* the
+ * regex-matched spans — for a secret repeated where the regex does not
+ * reach (e.g. pasted into a comment). The scan is raw substring matching,
+ * so a short or common captured value may also hit unrelated content that
+ * happens to contain it; intended for long, high-entropy secrets.
+ *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`) currently degrades to `mode: "deny"` (the file is unreadable
  * inside the sandbox).
@@ -235,6 +242,19 @@ export const CredentialFileConfigSchema = z.object({
         'warning, file left readable), "deny" (degrade to mode "deny" — ' +
         'file unreadable), or "error" (throw at wrap time). Only meaningful ' +
         'with mode "mask" and extract set.',
+    ),
+  maskDuplicates: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, verbatim occurrences of each captured credential value ' +
+        'outside the regex-matched spans are also replaced with the ' +
+        'corresponding sentinel — for a secret repeated where the regex ' +
+        'does not reach (e.g. in a comment). Matches raw substrings: short ' +
+        'or common credential values may corrupt unrelated content, so ' +
+        'this is intended for long, high-entropy secrets. Defaults to ' +
+        'false. Only meaningful with mode "mask" and extract; accepted ' +
+        'but ignored otherwise.',
     ),
   injectHosts: z
     .array(domainPatternSchema)
