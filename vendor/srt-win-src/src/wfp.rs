@@ -71,10 +71,10 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 /// theirs. {2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21}
 pub const DEFAULT_SUBLAYER_GUID: GUID = GUID::from_u128(0x2c5d0ad6_5f3b_4d4e_9b8f_1a3e7c9d0b21);
 
-/// Default loopback port range for the PERMIT filter. The JS
-/// http/socks proxies bind inside this range on Windows so the
-/// sandboxed child can reach them. Ten ports leaves headroom for
-/// http + socks + future listeners and for `EADDRINUSE` retries.
+/// Default loopback port range for the PERMIT filter. The JS mux
+/// proxy (front-end + http backend) binds inside this range on
+/// Windows so the sandboxed child can reach it. Ten ports leaves
+/// headroom for both listeners and for `EADDRINUSE` retries.
 /// Overridable via `--proxy-port-range`.
 pub const DEFAULT_PROXY_PORT_RANGE: (u16, u16) = (60080, 60089);
 
