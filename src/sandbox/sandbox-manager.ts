@@ -72,6 +72,7 @@ import { matchesDomainPattern } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
+import { dirname } from 'node:path'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -494,6 +495,19 @@ async function initialize(
     // Filesystem grants/denies — additive sandbox-user ACEs.
     try {
       const acc = computeWindowsFsAccessSet(runtimeConfig)
+      // The trust bundle the CA-trust env vars point at
+      // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
+      // srt-sandbox child. It's written into the broker's %TEMP%,
+      // which the sandbox user has no inherent rights on, so it
+      // rides the same session-level `acl grant` read-set as the
+      // working tree. Granted on the mkdtemp DIR (not the file)
+      // so the (OI)(CI) ACE covers both the file open AND the
+      // parent-directory list that cmd's `type`/`FindFirstFile`
+      // does before opening. Mirrors the mac/linux
+      // `expandedAllowRead` push in wrapWithSandbox.
+      if (mitmCA) {
+        acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+      }
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -1452,7 +1466,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * Update the sandbox configuration in place.
  *
  * **Network/allowlist changes are a live swap**: the running
- * http/socks proxies read `config.network.allowedDomains` /
+ * mux proxy reads `config.network.allowedDomains` /
  * `deniedDomains` per-request (via `filterNetworkRequest`), so
  * reassigning `config` here takes effect on the next connection
  * with no proxy rebind and no port change — on every platform,

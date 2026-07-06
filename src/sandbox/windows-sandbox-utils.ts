@@ -29,8 +29,8 @@ import type { SrtWinConfig } from './sandbox-config.js'
  * provides an `exec` subcommand that spawns the target via a two-hop
  * launch (broker → `CreateProcessWithLogonW(runner)` → runner →
  * restricted-token child) under `srt-sandbox`. The sandboxed child
- * reaches the host only via the JS http/socks proxies, which the
- * caller passes in via `--env`.
+ * reaches the host only via the JS mux proxy, which the caller
+ * passes in via `--env`.
  *
  * The separate-user account structurally closes the surrogate-spawn
  * class (schtasks, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, BITS,
@@ -201,9 +201,17 @@ export function parseWindowsBinShell(raw?: string): WindowsBinShell {
 
 export interface WindowsSandboxParams {
   command: string
-  /** JS HTTP proxy port — fed to `generateProxyEnvVars` for the env overlay. */
+  /**
+   * JS HTTP proxy port — fed to `generateProxyEnvVars` for the env
+   * overlay. With the in-process proxy this is the mux front-end
+   * port (same as `socksProxyPort`).
+   */
   httpProxyPort?: number
-  /** JS SOCKS proxy port — fed to `generateProxyEnvVars` for the env overlay. */
+  /**
+   * JS SOCKS proxy port — fed to `generateProxyEnvVars` for the env
+   * overlay. With the in-process proxy this is the mux front-end
+   * port (same as `httpProxyPort`).
+   */
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
@@ -237,19 +245,24 @@ export interface WindowsSandboxParams {
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
-   * PEM-encoded CA certificate file. Same parameter macOS/Linux
-   * thread to {@link generateProxyEnvVars} for the env-var trust
-   * layer (`NODE_EXTRA_CA_CERTS` etc.). NOT passed to `srt-win
-   * exec` — schannel-level trust under the sandbox user is set
-   * separately via `srt-win user trust-ca` /
-   * {@link windowsTrustCa}; per-exec only sets the env-var layer.
+   * Path to the TLS-termination trust bundle (the MITM CA + system
+   * roots) — fed to {@link generateProxyEnvVars} so the child's
+   * `NODE_EXTRA_CA_CERTS` / `CURL_CA_BUNDLE` / `SSL_CERT_FILE` /
+   * etc. point at it. Backslashes are normalised to forward slashes
+   * before emission so the value survives msys2 env conversion AND
+   * is accepted by native tools.
    *
-   * Currently NOT forwarded to the child: the bundle file lives in
-   * the broker's `%TEMP%`, which the `srt-sandbox` user cannot
-   * read, so OpenSSL clients (msys2 curl, openssl-backed git, node,
-   * python) would fail with `ACCESS_DENIED` on the bundle. The
-   * schannel-level trust set via {@link windowsTrustCa} is the only
-   * CA-trust path until working-tree/profile grants land.
+   * The env-var layer covers OpenSSL-backed clients (msys2 curl,
+   * openssl-backed git, node, python, cargo). Schannel/.NET clients
+   * that read the Windows certificate store exclusively (System32
+   * `curl.exe`, `Invoke-WebRequest`, Go-built tools) trust via the
+   * separate `srt-win user trust-ca` / {@link windowsTrustCa}
+   * install-time write into the sandbox user's `CurrentUser\Root`.
+   *
+   * The caller is responsible for the sandbox user having read
+   * access to this path — `sandbox-manager.ts`'s `initialize()`
+   * pushes it into the session's `acl grant` read-set alongside the
+   * working-tree grants.
    */
   caCertPath?: string
   /**
@@ -1107,26 +1120,19 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same object feeds (a) the spawn env merge below and (b) the
   // explicit `--env` overlay for the runner.
   //
-  // The CA-bundle path is OMITTED: it points into the broker's
-  // `%TEMP%\srt-sandbox-…`, which the `srt-sandbox` user cannot
-  // read — OpenSSL-backed clients (msys2 curl, openssl-backed git,
-  // node, python) would fail to open it (curl exit 77 etc.).
-  // Schannel-level trust comes from the registry write `srt-win user
-  // trust-ca` did at install time; the env-var bundle layer lands
-  // with the working-tree/profile-grant work.
-  if (p.caCertPath !== undefined) {
-    logForDebugging(
-      `[Sandbox Windows] caCertPath '${p.caCertPath}' not forwarded ` +
-        `(broker %TEMP% is unreadable by srt-sandbox); schannel ` +
-        `trust via 'srt-win user trust-ca' is the only CA-trust ` +
-        `path for the two-hop launch`,
-    )
-  }
+  // The CA trust-bundle path is emitted with forward slashes:
+  // msys2's POSIX-path conversion leaves `C:/…` alone and every
+  // tool we set the var for (curl, git, node, python, …) accepts
+  // forward slashes on Windows; backslashes would be mangled if
+  // the value passes through a bash command line. Schannel-level
+  // trust comes from the registry write `srt-win user trust-ca`
+  // did at install time; the env-var layer here covers the
+  // OpenSSL-backed tools.
   const generated = envListToObject(
     generateProxyEnvVars(
       p.httpProxyPort,
       p.socksProxyPort,
-      undefined, // caCertPath — see above
+      p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
     ),
   )

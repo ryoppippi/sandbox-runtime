@@ -595,7 +595,7 @@ export const WindowsConfigSchema = z.object({
     })
     .optional()
     .describe(
-      'Inclusive [low, high] port range the JS http/socks proxies bind ' +
+      'Inclusive [low, high] port range the JS mux proxy listeners bind ' +
         'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
