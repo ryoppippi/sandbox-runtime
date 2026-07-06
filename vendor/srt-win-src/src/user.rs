@@ -21,14 +21,14 @@
 //! future multi-account design (e.g. per-session sandbox users)
 //! only adds members; the DACLs don't change.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::ffi::c_void;
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::NetworkManagement::NetManagement::{
-    NERR_UserExists, NERR_UserNotFound, NetApiBufferFree, NetUserAdd, NetUserDel, NetUserGetInfo,
-    NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_INFO_1003, USER_INFO_1008,
-    USER_PRIV_USER,
+    NERR_PasswordTooShort, NERR_UserExists, NERR_UserNotFound, NetApiBufferFree, NetUserAdd,
+    NetUserDel, NetUserGetInfo, NetUserModalsGet, NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT,
+    USER_INFO_1, USER_INFO_1003, USER_INFO_1008, USER_MODALS_INFO_0, USER_PRIV_USER,
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::System::Registry::{
@@ -96,10 +96,8 @@ const SID_BUILTIN_USERS: &str = "S-1-5-32-545";
 ///
 /// Requires elevation (NetUserAdd → `ERROR_ACCESS_DENIED` otherwise).
 pub fn provision() -> Result<ProvisionedUser> {
-    let password = gen_password().context("generate sandbox password")?;
-
     sam::ensure_local_group(SANDBOX_GROUP, "sandbox-runtime sandbox-user group")?;
-    ensure_user(SANDBOX_USER, &password)?;
+    let password = ensure_user(SANDBOX_USER)?;
 
     // Resolve the freshly-created user's SID so group membership is
     // added by PSID — see [`sam::add_member`].
@@ -202,7 +200,7 @@ fn gen_password() -> Result<String> {
     // ALPHA (85 doesn't divide 256). One refill is overwhelmingly
     // enough — the loop is a correctness backstop, not a hot path.
     let bound = (u8::MAX - (u8::MAX % ALPHA.len() as u8)) as usize;
-    let mut out = String::with_capacity(N);
+    let mut out = Vec::with_capacity(N);
     let mut i = 0usize;
     while out.len() < N {
         if i == raw.len() {
@@ -215,66 +213,153 @@ fn gen_password() -> Result<String> {
         let b = raw[i] as usize;
         i += 1;
         if b < bound {
-            out.push(ALPHA[b % ALPHA.len()] as char);
+            out.push(ALPHA[b % ALPHA.len()]);
         }
     }
-    Ok(out)
+    // Belt-and-suspenders for tightened complexity policies: if any of
+    // the four classes is absent, seed four consecutive positions
+    // (random base offset) with one forced pick from each. The retry
+    // loop in [`ensure_user`] is the primary defence; this makes the
+    // first attempt overwhelmingly likely to pass on its own.
+    const CLASSES: [&[u8]; 4] = [
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        b"abcdefghijklmnopqrstuvwxyz",
+        b"0123456789",
+        b"!#$%()*+,-./:;=?@[]_{}~",
+    ];
+    if CLASSES.iter().any(|c| !out.iter().any(|b| c.contains(b))) {
+        let mut extra = [0u8; 5];
+        let st = unsafe { BCryptGenRandom(None, &mut extra, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+        if st.0 != 0 {
+            return Err(anyhow!("BCryptGenRandom (seed): NTSTATUS=0x{:08x}", st.0));
+        }
+        let base = extra[0] as usize;
+        for (k, class) in CLASSES.iter().enumerate() {
+            out[(base + k) % N] = class[extra[1 + k] as usize % class.len()];
+        }
+    }
+    Ok(String::from_utf8(out).expect("ALPHA is ASCII"))
 }
 
 /// `NetUserAdd(level=1)` if absent; on `NERR_UserExists`,
 /// `NetUserSetInfo(level=1003)` to rotate the password and
 /// `NetUserSetInfo(level=1008)` to OR `UF_DONT_EXPIRE_PASSWD` into
-/// the existing flags. Either way the account ends up with
-/// `password` and a non-expiring password — even if an older build
-/// or a domain GPO cleared the flag since the previous install.
-fn ensure_user(name: &str, password: &str) -> Result<()> {
+/// the existing flags. Either way the account ends up with the
+/// returned password and a non-expiring password — even if an older
+/// build or a domain GPO cleared the flag since the previous install.
+///
+/// Both password-bearing calls retry on `NERR_PasswordTooShort`
+/// (2245) with a fresh [`gen_password`] draw — despite the name, SAM
+/// returns 2245 for *any* local-policy rejection (complexity /
+/// history / filter DLL), so a policy tightened between builds can
+/// bounce an otherwise-valid 32-char draw.
+fn ensure_user(name: &str) -> Result<String> {
     let mut name_w = wstr(name);
-    let mut pw_w = wstr(password);
     let mut comment_w = wstr("sandbox-runtime sandboxed-child account");
-    let info = USER_INFO_1 {
-        usri1_name: PWSTR(name_w.as_mut_ptr()),
-        usri1_password: PWSTR(pw_w.as_mut_ptr()),
-        usri1_password_age: 0,
-        usri1_priv: USER_PRIV_USER,
-        usri1_home_dir: PWSTR::null(),
-        usri1_comment: PWSTR(comment_w.as_mut_ptr()),
-        // UF_SCRIPT is required by SAM on workstation SKUs (legacy
-        // LAN-Manager flag); without it NetUserAdd returns
-        // NERR_BadUsername / ERROR_INVALID_PARAMETER.
-        usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
-        usri1_script_path: PWSTR::null(),
-    };
-    let rc = unsafe { NetUserAdd(PCWSTR::null(), 1, &info as *const _ as *const u8, None) };
-    if rc == 0 {
-        return Ok(());
+    // Bound in the header (defense-in-depth) *and* in the inner
+    // `attempt + 1 < MAX_PW_ATTEMPTS` guards — the last iteration
+    // falls through to the standard error branches, and if a future
+    // edit widens the guard the header still stops the loop.
+    for attempt in 0..MAX_PW_ATTEMPTS {
+        let password = gen_password().context("generate sandbox password")?;
+        let mut pw_w = wstr(&password);
+        let info = USER_INFO_1 {
+            usri1_name: PWSTR(name_w.as_mut_ptr()),
+            usri1_password: PWSTR(pw_w.as_mut_ptr()),
+            usri1_password_age: 0,
+            usri1_priv: USER_PRIV_USER,
+            usri1_home_dir: PWSTR::null(),
+            usri1_comment: PWSTR(comment_w.as_mut_ptr()),
+            // UF_SCRIPT is required by SAM on workstation SKUs (legacy
+            // LAN-Manager flag); without it NetUserAdd returns
+            // NERR_BadUsername / ERROR_INVALID_PARAMETER.
+            usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
+            usri1_script_path: PWSTR::null(),
+        };
+        let rc = unsafe { NetUserAdd(PCWSTR::null(), 1, &info as *const _ as *const u8, None) };
+        if rc == 0 {
+            return Ok(password);
+        }
+        if rc == NERR_PasswordTooShort && attempt + 1 < MAX_PW_ATTEMPTS {
+            diag_2245("NetUserAdd", attempt, &password);
+            continue;
+        }
+        if rc != NERR_UserExists {
+            return Err(anyhow!("NetUserAdd({name}): {rc}"));
+        }
+        // Already exists — rotate the password so the credential file
+        // about to be (re)written matches.
+        let info1003 = USER_INFO_1003 {
+            usri1003_password: PWSTR(pw_w.as_mut_ptr()),
+        };
+        let rc = unsafe {
+            NetUserSetInfo(
+                PCWSTR::null(),
+                pcwstr(&name_w),
+                1003,
+                &info1003 as *const _ as *const u8,
+                None,
+            )
+        };
+        if rc == NERR_PasswordTooShort && attempt + 1 < MAX_PW_ATTEMPTS {
+            diag_2245("NetUserSetInfo(1003)", attempt, &password);
+            continue;
+        }
+        if rc != 0 {
+            return Err(anyhow!(
+                "NetUserSetInfo({name}, level=1003 password rotate): {rc}"
+            ));
+        }
+        ensure_dont_expire(name, &name_w)?;
+        return Ok(password);
     }
-    if rc != NERR_UserExists {
-        return Err(anyhow!("NetUserAdd({name}): {rc}"));
+    bail!(
+        "ensure_user({name}): password rejected by local policy after \
+         {MAX_PW_ATTEMPTS} attempts (NERR_PasswordTooShort=2245)"
+    )
+}
+
+const MAX_PW_ATTEMPTS: usize = 5;
+
+/// Dump the local password policy and the failing password's class
+/// composition (never the password itself) to stderr, so a 2245 on a
+/// runner or a customer box is diagnosable from logs alone.
+fn diag_2245(op: &str, attempt: usize, password: &str) {
+    let (mut u, mut l, mut d, mut s) = (0u32, 0u32, 0u32, 0u32);
+    for b in password.bytes() {
+        match b {
+            b'A'..=b'Z' => u += 1,
+            b'a'..=b'z' => l += 1,
+            b'0'..=b'9' => d += 1,
+            _ => s += 1,
+        }
     }
-    // Already exists — rotate the password so the credential file
-    // about to be (re)written matches.
-    let info1003 = USER_INFO_1003 {
-        usri1003_password: PWSTR(pw_w.as_mut_ptr()),
-    };
-    let rc = unsafe {
-        NetUserSetInfo(
-            PCWSTR::null(),
-            pcwstr(&name_w),
-            1003,
-            &info1003 as *const _ as *const u8,
-            None,
+    let mut buf: *mut u8 = std::ptr::null_mut();
+    let (min_len, hist) = if unsafe { NetUserModalsGet(PCWSTR::null(), 0, &mut buf) } == 0 {
+        let m = unsafe { *(buf as *const USER_MODALS_INFO_0) };
+        unsafe {
+            let _ = NetApiBufferFree(Some(buf as *const c_void));
+        }
+        (
+            m.usrmod0_min_passwd_len as i64,
+            m.usrmod0_password_hist_len as i64,
         )
+    } else {
+        (-1, -1)
     };
-    if rc != 0 {
-        return Err(anyhow!(
-            "NetUserSetInfo({name}, level=1003 password rotate): {rc}"
-        ));
-    }
+    eprintln!(
+        "srt-win: {op} 2245 (attempt {}/{MAX_PW_ATTEMPTS}) — policy: min_len={min_len} hist={hist}; \
+         pw classes: U={u} L={l} D={d} S={s}; retrying",
+        attempt + 1
+    );
+}
+
+fn ensure_dont_expire(name: &str, name_w: &[u16]) -> Result<()> {
     // Re-assert UF_DONT_EXPIRE_PASSWD: read level-1 flags, OR in,
     // write back via level-1008 (flags only — level-1 SetInfo would
     // overwrite priv/home_dir/comment).
     let mut buf: *mut u8 = std::ptr::null_mut();
-    let rc = unsafe { NetUserGetInfo(PCWSTR::null(), pcwstr(&name_w), 1, &mut buf) };
+    let rc = unsafe { NetUserGetInfo(PCWSTR::null(), pcwstr(name_w), 1, &mut buf) };
     if rc != 0 {
         return Err(anyhow!("NetUserGetInfo({name}, level=1): {rc}"));
     }
@@ -288,7 +373,7 @@ fn ensure_user(name: &str, password: &str) -> Result<()> {
     let rc = unsafe {
         NetUserSetInfo(
             PCWSTR::null(),
-            pcwstr(&name_w),
+            pcwstr(name_w),
             1008,
             &info1008 as *const _ as *const u8,
             None,
@@ -388,6 +473,11 @@ mod tests {
         for c in ['"', '\\', '`', ' ', '&', '|', '<', '>', '^'] {
             assert!(!p.contains(c), "password contains '{c}': {p}");
         }
+        // At least one from each complexity class (post-seed guarantee).
+        assert!(p.bytes().any(|b| b.is_ascii_uppercase()), "{p}");
+        assert!(p.bytes().any(|b| b.is_ascii_lowercase()), "{p}");
+        assert!(p.bytes().any(|b| b.is_ascii_digit()), "{p}");
+        assert!(p.bytes().any(|b| !b.is_ascii_alphanumeric()), "{p}");
         // Two calls differ (overwhelmingly).
         assert_ne!(p, gen_password().unwrap());
     }
