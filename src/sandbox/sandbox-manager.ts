@@ -8,7 +8,12 @@ import {
   MaskedFileStore,
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
-import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
+import {
+  createMitmCA,
+  CRL_PATH,
+  disposeMitmCA,
+  type MitmCA,
+} from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
@@ -608,6 +613,18 @@ async function initialize(
         : undefined
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
+      // Leaves are minted lazily per-CONNECT (after this point), so setting
+      // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
+      // Windows-only: on Linux the child runs under bwrap --unshare-net and
+      // reaches the proxy via a socat bridge on a fixed netns port, so a
+      // host-namespace mux port would be unreachable — worse than no CDP,
+      // since a Schannel-analog client (Java, OpenSSL with CRL_CHECK) then
+      // hard-fails "CRL fetch error" instead of soft-passing "no CDP". macOS
+      // has no in-tree Schannel-analog client. Also gated on `muxPort`: an
+      // external `network.httpProxyPort` doesn't answer /srt.crl.
+      if (mitmCA && muxPort !== undefined && getPlatform() === 'windows') {
+        mitmCA.crlUrl = `http://127.0.0.1:${muxPort}${CRL_PATH}`
+      }
       if (config.network.httpProxyPort !== undefined) {
         logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
       }

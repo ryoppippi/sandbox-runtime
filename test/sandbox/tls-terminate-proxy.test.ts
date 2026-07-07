@@ -107,6 +107,18 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
     expect(JSON.parse(r.body).path).toBe('/ping')
   })
 
+  test('serves the empty CRL at GET /srt.crl (Schannel revocation)', async () => {
+    // CryptoAPI fetches the leaf's cRLDistributionPoints URL as an
+    // origin-form GET over plain HTTP with no Proxy-Authorization, so this
+    // route sits before both the auth check and the absolute-URI parse.
+    // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins -- bun:test runtime has stable fetch
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/srt.crl`)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('application/pkix-crl')
+    const body = Buffer.from(await res.arrayBuffer())
+    expect(body.equals(ca.crlDer)).toBe(true)
+  })
+
   test('absolute-form request-target is normalized (filterRequest + upstream)', async () => {
     // RFC 7230 §5.3.2 absolute-form. Some clients send this inside CONNECT
     // tunnels; without normalization the host concat produced a malformed

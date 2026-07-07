@@ -1183,9 +1183,11 @@ describe.if(isWindows)(
 // `CURL_CA_BUNDLE`, so the curl row gates on an OpenSSL build being
 // present; git defaults to the schannel backend (which ignores
 // `GIT_SSL_CAINFO`), so the git row forces `http.sslBackend=openssl`;
-// cargo's vendored Schannel libcurl honors `CARGO_HTTP_CAINFO` but
-// hard-fails revocation against a CRL-less private CA, so it pairs
-// with `CARGO_HTTP_CHECK_REVOKE=false`.
+// cargo's vendored Schannel libcurl honors `CARGO_HTTP_CAINFO`.
+// Schannel's revocation check on the leaf is satisfied by the CDP →
+// empty CRL the proxy serves at `/srt.crl` — no per-tool
+// `--ssl-no-revoke` / `schannelCheckRevoke=false` /
+// `CARGO_HTTP_CHECK_REVOKE=false` needed.
 
 // Committed test-only CA — see test/fixtures/tls-terminate/README.md.
 const TLS_FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
@@ -1501,32 +1503,68 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
   it('G8: System32 curl (Schannel) trusts via the sandbox-user Root install, NOT CURL_CA_BUNDLE', async () => {
     // Schannel curl ignores CURL_CA_BUNDLE/SSL_CERT_FILE by design
     // — trust comes from the sandbox user's `CurrentUser\Root`,
-    // which `windowsTrustCa` populated in beforeAll. Revocation
-    // hard-fails against a CRL-less private CA under Schannel, so
-    // `--ssl-no-revoke` is needed for this row (only System32 curl
-    // has the flag; the OpenSSL builds don't check CRLs by default).
+    // which `windowsTrustCa` populated in beforeAll. Revocation is
+    // checked on the LEAF: minted leaves carry a CDP pointing at the
+    // proxy's `/srt.crl` (empty CRL), so no `--ssl-no-revoke` needed.
     SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
     const sysCurl = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe`
     const r = await runSandboxedUntil(
-      `"${sysCurl}" -sS --ssl-no-revoke -o NUL -w "%{http_code}" https://example.com/`,
+      `"${sysCurl}" -sS -o NUL -w "%{http_code}" https://example.com/`,
       x => x.status === 0,
     )
     expectStatus('G8', r, [0])
     expect(r.stdout).toContain('200')
   }, 60_000)
 
+  it.skipIf(GIT === undefined)(
+    'G8b: git schannel backend passes revocation via the served CRL (no schannelCheckRevoke=false)',
+    async () => {
+      // Trust: `-c http.schannelUseSSLCAInfo=true` makes git-schannel
+      // honor `GIT_SSL_CAINFO` (the trust bundle #346 emits). Without
+      // it, git-for-windows' patched http.c clears sslCAInfo so
+      // schannel reads the Windows store — but on the CI runner that
+      // path hits SEC_E_UNTRUSTED_ROOT (system-gitconfig drift; the
+      // store-trust path is proven by G8's curl row).
+      // Revocation: what this row TESTS — the leaf's CDP → empty CRL
+      // on the proxy port means NO `http.schannelCheckRevoke=false`
+      // is needed. `-c http.sslBackend=schannel` is explicit so the
+      // row is hermetic against the runner's default backend.
+      // git-via-proxy is heavier than curl (smart-HTTP), so
+      // 45s/attempt + 120s overall.
+      SandboxManager.updateConfig(
+        createTlsTestConfig(['example.com', 'github.com']),
+      )
+      const r = await runSandboxedUntil(
+        `"${GIT}" -c http.sslBackend=schannel -c http.schannelUseSSLCAInfo=true ` +
+          `ls-remote https://github.com/git/git.git HEAD`,
+        x => x.status === 0 && /HEAD/.test(x.stdout),
+        2,
+        45_000,
+      )
+      if (r.status !== 0) {
+        // Diagnostic: dump the effective git http.* config so a
+        // failure names the runner's system-gitconfig state.
+        const cfg = await runSandboxed(
+          `"${GIT}" config --list --show-origin 2>&1 | findstr /i "ssl schannel backend"`,
+        )
+        r.stderr += `\n[G8b diag: git http config]\n${cfg.stdout}${cfg.stderr}`
+      }
+      expectStatus('G8b', r, [0])
+      expect(r.stdout).toMatch(/HEAD/)
+    },
+    120_000,
+  )
+
   it.skipIf(CARGO === undefined)(
     'G9: cargo trusts the MITM CA via CARGO_HTTP_CAINFO',
     async () => {
       // cargo's vendored libcurl is Schannel but honors `CAINFO`
-      // (replace semantics). Like the tool/cargo row, schannel's
-      // CRL fetch goes through CryptoAPI/WinHTTP (no proxy env), so
-      // CARGO_HTTP_CHECK_REVOKE=false is required against a CRL-less
-      // private CA. Set inline via cmd — the two-hop child sees the
-      // runner's --env overlay only, not the broker's spawn env.
-      // Skips when cargo lives under the broker's profile
-      // (`~/.cargo/bin` on GHA runners) — srt-sandbox cannot read
-      // it; see `sandboxReachable`.
+      // (replace semantics). Revocation is satisfied by the leaf's
+      // CDP → empty CRL served on the proxy port, so no
+      // `CARGO_HTTP_CHECK_REVOKE=false` needed. Skips when cargo
+      // lives under the broker's profile (`~/.cargo/bin` on GHA
+      // runners) — srt-sandbox cannot read it; see
+      // `sandboxReachable`.
       SandboxManager.updateConfig(
         createTlsTestConfig([
           'crates.io',
@@ -1535,7 +1573,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
         ]),
       )
       const r = await runSandboxedUntil(
-        `set CARGO_HTTP_CHECK_REVOKE=false&& "${CARGO}" search serde --limit 1`,
+        `"${CARGO}" search serde --limit 1`,
         x => x.status === 0 && /serde/.test(x.stdout),
         2,
         30_000,
