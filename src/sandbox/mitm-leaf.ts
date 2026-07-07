@@ -15,10 +15,11 @@ import {
   caSubjectKeyId,
   daysFromNow,
   randomSerial,
+  signCertificateNative,
   type MitmCA,
 } from './mitm-ca.js'
 
-const { pki, md } = forge
+const { pki } = forge
 
 export type LeafCert = {
   /** Leaf cert PEM followed by the CA cert PEM (full chain). */
@@ -79,7 +80,7 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
         ]
       : []),
   ])
-  cert.sign(ca.key, md.sha256.create())
+  signCertificateNative(cert, ca.keyPem)
 
   const leaf: LeafCert = {
     certPem: pki.certificateToPem(cert) + ca.certPem,

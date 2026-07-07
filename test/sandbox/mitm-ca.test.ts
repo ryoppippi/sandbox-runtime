@@ -10,7 +10,11 @@ import {
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import forge from 'node-forge'
-import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
+import {
+  createMitmCA,
+  disposeMitmCA,
+  signCertificateNative,
+} from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 import { whichSync } from '../../src/utils/which.js'
 
@@ -142,6 +146,43 @@ describe('mitm-ca: ephemeral generation', () => {
     await disposeMitmCA(user)
     expect(existsSync(bundleDir)).toBe(false)
     expect(existsSync(certPath)).toBe(true) // fixture untouched
+  })
+
+  test('signCertificateNative is byte-identical to node-forge cert.sign()', async () => {
+    // RSASSA-PKCS1-v1_5 is deterministic, so signing the same TBSCertificate
+    // with the same key via native crypto and via node-forge's pure-JS RSA
+    // must produce the same signature bytes — and therefore the same PEM.
+    // This is the equivalence guarantee that lets generateEphemeralCA(),
+    // generateEmptyCrl(), and mintLeafCert() use native crypto for the RSA
+    // private-key operation without changing what ends up on the wire.
+    const ca = createMitmCA({})
+    try {
+      const { pki, md } = forge
+      // Rebuild an unsigned copy of the ephemeral CA's own cert (same
+      // subject/issuer/serial/validity/extensions/public key), then sign that
+      // one copy with node-forge. `ca.cert` was signed via the native path.
+      const ref = pki.createCertificate()
+      ref.publicKey = ca.cert.publicKey
+      ref.serialNumber = ca.cert.serialNumber
+      ref.validity.notBefore = ca.cert.validity.notBefore
+      ref.validity.notAfter = ca.cert.validity.notAfter
+      ref.setSubject(ca.cert.subject.attributes)
+      ref.setIssuer(ca.cert.issuer.attributes)
+      ref.setExtensions(ca.cert.extensions)
+      ref.sign(ca.key, md.sha256.create())
+
+      expect(Buffer.from(ca.cert.signature, 'binary')).toEqual(
+        Buffer.from(ref.signature, 'binary'),
+      )
+      expect(ca.certPem).toBe(pki.certificateToPem(ref))
+      // Re-signing the reference cert via the native path is also identical.
+      signCertificateNative(ref, ca.keyPem)
+      expect(ca.certPem).toBe(pki.certificateToPem(ref))
+      // And node-forge's own verifier accepts the native-signed cert.
+      expect(ref.verify(ca.cert)).toBe(true)
+    } finally {
+      await disposeMitmCA(ca)
+    }
   })
 
   test('throws when only one of caCertPath/caKeyPath is provided', () => {

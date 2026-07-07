@@ -9,6 +9,7 @@
  */
 
 import forge from 'node-forge'
+import { sign as cryptoSign } from 'node:crypto'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -18,6 +19,13 @@ import { logForDebugging } from '../utils/debug.js'
 import type { LeafCert } from './mitm-leaf.js'
 
 const { asn1, pki, md, random, util } = forge
+
+// node-forge exports pki.getTBSCertificate at runtime; @types/node-forge omits it.
+const getTBSCertificate = (
+  pki as unknown as {
+    getTBSCertificate: (c: forge.pki.Certificate) => forge.asn1.Asn1
+  }
+).getTBSCertificate
 
 /**
  * Matches one PEM CERTIFICATE block. Used to extract just the certificates
@@ -99,6 +107,48 @@ export function caSubjectKeyId(caCert: forge.pki.Certificate): string {
   return ext?.subjectKeyIdentifier
     ? util.hexToBytes(ext.subjectKeyIdentifier)
     : caCert.generateSubjectKeyIdentifier().getBytes()
+}
+
+/**
+ * Drop-in replacement for `cert.sign(key, md.sha256.create())` that computes
+ * the RSASSA-PKCS1-v1_5 / SHA-256 signature via Node's native `crypto.sign()`
+ * instead of node-forge's pure-JS RSA.
+ *
+ * node-forge routes RSA *keypair generation* to native `crypto` when available,
+ * but its `PrivateKey.sign()` is always pure JS: jsbn `BigInteger.modPow`
+ * (~3000 Montgomery squarings for a 2048-bit modulus). On a JIT engine that's
+ * ~50–70 ms per signature; on an interpreter or baseline-only tier it can be
+ * an order of magnitude worse — and `generateEphemeralCA()` runs on the cold
+ * path of every process that constructs a SandboxManager. Native
+ * `crypto.sign()` is ~1–2 ms and, because RSASSA-PKCS1-v1_5 is deterministic,
+ * produces byte-identical output. See test/sandbox/mitm-ca.test.ts for the
+ * byte-for-byte equivalence check.
+ */
+export function signCertificateNative(
+  cert: forge.pki.Certificate,
+  keyPem: string,
+): void {
+  const oid = pki.oids.sha256WithRSAEncryption
+  cert.siginfo.algorithmOid = oid
+  cert.signatureOid = oid
+  cert.tbsCertificate = getTBSCertificate(cert)
+  const tbsDer = asn1.toDer(cert.tbsCertificate).getBytes()
+  cert.signature = rsaSha256SignNative(tbsDer, keyPem)
+  // Match cert.sign()'s side effect so callers that read cert.md see the same
+  // populated digest a forge-signed cert would carry.
+  cert.md = md.sha256.create()
+  cert.md.update(tbsDer)
+}
+
+/**
+ * RSASSA-PKCS1-v1_5 / SHA-256 sign of a forge binary-string `der` with the
+ * PEM-encoded RSA private key `keyPem`, returning the signature as a forge
+ * binary string. Native equivalent of `forgeKey.sign(sha256Digest)`.
+ */
+export function rsaSha256SignNative(der: string, keyPem: string): string {
+  return cryptoSign('sha256', Buffer.from(der, 'binary'), keyPem).toString(
+    'binary',
+  )
 }
 
 /**
@@ -222,7 +272,7 @@ function writeTrustBundle(
  */
 export function generateEmptyCrl(
   cert: forge.pki.Certificate,
-  key: forge.pki.rsa.PrivateKey,
+  keyPem: string,
 ): Buffer {
   const SHA256_RSA = pki.oids.sha256WithRSAEncryption
   const sigAlg = () =>
@@ -285,9 +335,7 @@ export function generateEmptyCrl(
     crlExtensions,
   ])
 
-  const digest = md.sha256.create()
-  digest.update(asn1.toDer(tbsCertList).getBytes())
-  const sig = key.sign(digest)
+  const sig = rsaSha256SignNative(asn1.toDer(tbsCertList).getBytes(), keyPem)
 
   const crl = seq([
     tbsCertList,
@@ -355,7 +403,7 @@ function loadCA(
     key: key as forge.pki.rsa.PrivateKey,
     leafCerts: new Map(),
     secureContexts: new Map(),
-    crlDer: generateEmptyCrl(cert, key as forge.pki.rsa.PrivateKey),
+    crlDer: generateEmptyCrl(cert, keyPem),
     ephemeral: false,
   }
 }
@@ -384,10 +432,10 @@ function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
     },
     { name: 'subjectKeyIdentifier' },
   ])
-  cert.sign(keys.privateKey, md.sha256.create())
+  const keyPem = pki.privateKeyToPem(keys.privateKey)
+  signCertificateNative(cert, keyPem)
 
   const certPem = pki.certificateToPem(cert)
-  const keyPem = pki.privateKeyToPem(keys.privateKey)
 
   // Write to disk so trust env vars (NODE_EXTRA_CA_CERTS etc.) can point at
   // a real path. mkdtemp gives us an unguessable per-process directory.
@@ -409,7 +457,7 @@ function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
     key: keys.privateKey,
     leafCerts: new Map(),
     secureContexts: new Map(),
-    crlDer: generateEmptyCrl(cert, keys.privateKey),
+    crlDer: generateEmptyCrl(cert, keyPem),
     ephemeral: true,
   }
 }
