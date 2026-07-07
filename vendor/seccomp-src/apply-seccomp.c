@@ -116,6 +116,9 @@
 #ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
 #  define SECCOMP_USER_NOTIF_FLAG_CONTINUE (1UL << 0)
 #endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC_ESRCH
+#  define SECCOMP_FILTER_FLAG_TSYNC_ESRCH (1UL << 4)
+#endif
 #ifndef SECCOMP_GET_NOTIF_SIZES
 #  define SECCOMP_GET_NOTIF_SIZES 3
 #endif
@@ -311,6 +314,21 @@ static int recv_fd(int sock) {
  * post-filter to keep this set closed. */
 static void install_observe_filter(int sp_fd) {
     if (sp_fd < 0) return;
+
+    /* The supervisor replies with SECCOMP_USER_NOTIF_FLAG_CONTINUE, which
+     * kernels older than 5.5 reject with EINVAL *without* completing the
+     * notification — the trapped syscall would block forever. CONTINUE is
+     * a response flag with no direct probe, so detect it the way
+     * libseccomp does: validate a filter flag from the same era with a
+     * NULL prog. EFAULT = flag known (nothing installed), EINVAL = too
+     * old — skip the observer entirely and stay fail-open. */
+    if (!(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                  SECCOMP_FILTER_FLAG_TSYNC_ESRCH, NULL) == -1 &&
+          errno == EFAULT)) {
+        (void)!write(sp_fd, "E", 1);
+        close(sp_fd);
+        return;
+    }
 
     struct sock_filter filt[80];
     int len = build_observe_bpf(filt, (int)(sizeof(filt)/sizeof(filt[0])));
