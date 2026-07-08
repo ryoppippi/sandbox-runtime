@@ -1107,20 +1107,23 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 }
             };
 
-            // Share-lock current_exe(): open with FILE_SHARE_READ
-            // only (no SHARE_WRITE|SHARE_DELETE) so a sandboxed
-            // child can't rename/overwrite the broker binary
-            // mid-exec — closes the "sandboxed command overwrites
-            // the broker → next exec runs attacker binary" hole for
-            // standalone-`srt-win.exe` consumers under a `.`-granted
-            // cwd. Moot when the consumer sets `srtWin.path =
-            // process.execPath` (a running binary is already
-            // section-mapped so writes fail with
-            // ERROR_SHARING_VIOLATION), but standalone
-            // `vendor/srt-win.exe` needs it. Acquired BEFORE per-
-            // exec stamps so a stamp failure still had the lock
-            // held; released by process-exit handle cleanup.
-            let _exe_lock = share_lock_current_exe().context("share-lock current_exe")?;
+            // Share-lock current_exe() so a sandboxed child can't
+            // rename/overwrite the broker binary mid-exec — see
+            // `self_protect::share_lock_current_exe` for the threat
+            // model. Acquired BEFORE per-exec stamps so a stamp
+            // failure still had the lock held; released by
+            // process-exit handle cleanup. Warn-and-continue:
+            // defense-in-depth must not DoS the primary path when a
+            // third-party opener (AV/indexer/updater) holds DELETE
+            // access.
+            let _exe_lock = srt_win::self_protect::share_lock_current_exe()
+                .inspect_err(|e| {
+                    eprintln!(
+                        "srt-win: WARNING: share-lock current_exe: \
+                         {e:#} (proceeding; defense-in-depth only)"
+                    )
+                })
+                .ok();
 
             // No WFP pre-flight here: BFE enumeration is
             // admin-gated, so a non-elevated broker can't read it.
@@ -1188,9 +1191,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // it; non-elevated real-user siblings can still
             // query/debug the broker. Best-effort.
             let real_user = srt_win::sid::current_user_sid()?;
-            if let Err(e) = srt_win::self_protect::install_broker_dacl(Some(&real_user))
-                && !quiet
-            {
+            if let Err(e) = srt_win::self_protect::install_broker_dacl(Some(&real_user)) {
                 eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
             }
             // env_overlay = exactly what the caller passed via
@@ -1242,45 +1243,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Open `current_exe()` with `GENERIC_READ` + `FILE_SHARE_READ` only
-/// (no `FILE_SHARE_WRITE|FILE_SHARE_DELETE`) and return the handle.
-/// While held, any attempt to open the file for write/delete — and
-/// therefore rename-over/`MoveFileEx`/`SetFileInformationByHandle`
-/// (`FileRenameInfo`) onto it — fails with `ERROR_SHARING_VIOLATION`.
-/// See the `Cmd::Exec` call site for the threat model.
-fn share_lock_current_exe() -> anyhow::Result<srt_win::util::OwnedHandle> {
-    use anyhow::{Context, anyhow};
-    use srt_win::util::{OwnedHandle, pcwstr, wstr};
-    use windows::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, OPEN_EXISTING,
-    };
-    let exe = std::env::current_exe().context("current_exe")?;
-    let exe_s = exe
-        .to_str()
-        .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
-    let w = wstr(exe_s);
-    let h = unsafe {
-        CreateFileW(
-            pcwstr(&w),
-            GENERIC_READ.0,
-            FILE_SHARE_READ,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-        )
-    }
-    .with_context(|| format!("CreateFileW('{}', SHARE_READ-only)", exe.display()))?;
-    if h == INVALID_HANDLE_VALUE {
-        return Err(anyhow!(
-            "CreateFileW('{}'): INVALID_HANDLE_VALUE",
-            exe.display()
-        ));
-    }
-    Ok(OwnedHandle(h))
 }
 
 fn is_elevated() -> anyhow::Result<bool> {

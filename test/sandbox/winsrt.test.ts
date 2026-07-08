@@ -1146,7 +1146,13 @@ describe.if(isWindows)(
         }
         await closed
         for (let i = 0; i < 20; i++) {
-          if (findChild() === undefined) return
+          if (findChild() === undefined) {
+            // Cleared so the finally's belt-and-suspenders taskkill
+            // doesn't fire on a dead PID (which a busy runner may
+            // have already reused).
+            childPid = undefined
+            return
+          }
           await new Promise(r => setTimeout(r, 500))
         }
         throw new Error(
