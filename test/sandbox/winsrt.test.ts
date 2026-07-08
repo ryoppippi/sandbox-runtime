@@ -298,6 +298,28 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       /windows\.srtWin\.path is set to '.+' but the file does not exist/,
     )
   })
+
+  it('drops NO_PROXY/no_proxy from the --env overlay (WFP fences direct loopback)', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'curl http://127.0.0.1:9000/',
+      httpProxyPort: 60080,
+      socksProxyPort: 60080,
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    // On POSIX, NO_PROXY=localhost,127.0.0.1,… lets the child connect
+    // directly (seatbelt/bwrap allow loopback). On Windows the WFP
+    // fence blocks direct loopback outside the proxy-port PERMIT
+    // range, so NO_PROXY would make every localhost request fail. The
+    // returned `env` is the BROKER spawn env (spreads process.env, so
+    // may inherit a host NO_PROXY — irrelevant, srt-win runs as the
+    // real user); only the `--env` overlay reaches the sandboxed child.
+    expect(envArgs.some(e => e.startsWith('NO_PROXY='))).toBe(false)
+    expect(envArgs.some(e => e.startsWith('no_proxy='))).toBe(false)
+    // The proxy vars themselves survive — only the bypass list is dropped.
+    expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
+  })
 })
 
 describe('parseWindowsBinShell (pure, all platforms)', () => {

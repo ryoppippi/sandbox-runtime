@@ -1250,6 +1250,18 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
+  // NO_PROXY=localhost,127.0.0.1,… is correct on POSIX where seatbelt/
+  // bwrap allow direct loopback: a NO_PROXY match makes the client
+  // connect directly and it works. On Windows the WFP fence blocks
+  // ALL direct connects from the sandbox user — including loopback
+  // outside the proxy-port PERMIT range — so NO_PROXY makes clients
+  // bypass the proxy and hit the fence; every localhost/127.0.0.1
+  // request fails. Consumers currently work around with
+  // `curl --noproxy ""`. Drop NO_PROXY here so localhost goes through
+  // the proxy (which connects on the child's behalf, from the broker's
+  // SID, and is not fenced).
+  delete generated.NO_PROXY
+  delete generated.no_proxy
 
   // GIT_CONFIG_* set — safe.directory (dubious-ownership) + the
   // schannel CA knobs. Composed against setEnvVars so a caller
