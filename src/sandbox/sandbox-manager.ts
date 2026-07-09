@@ -8,12 +8,13 @@ import {
   MaskedFileStore,
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
+import { mintFakeJwt, verifyJwt } from './credential-decode.js'
 import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import { randomBytes, X509Certificate } from 'node:crypto'
+import { randomBytes, randomUUID, X509Certificate } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -689,6 +690,13 @@ function checkDependencies(ripgrepConfig?: {
  * environment is skipped — there is nothing to protect, and emitting an
  * unset var would change tool behaviour (presence checks would pass where
  * they didn't before).
+ *
+ * A masked var with `decode: 'jwt'` expects its whole value to be a JWT:
+ * the value is verified ({@link verifyJwt}) and replaced by a JWT-shaped
+ * fake ({@link mintFakeJwt}) registered as a caller-minted sentinel, so
+ * token-parsing tools inside the sandbox keep working and the proxy swaps
+ * the whole fake token on egress. A set value that does not verify fails
+ * open with a loud stderr warning (see {@link CredentialEnvVarConfigSchema}).
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
@@ -721,6 +729,34 @@ function getCredentialRestrictions(
       // the sandbox can reach — narrow it explicitly when the credential
       // should only go to a subset.
       const injectHosts = v.injectHosts ?? allowedDomains ?? []
+      if (v.decode === 'jwt') {
+        if (!verifyJwt(real)) {
+          // Nothing was masked — the operator declared the value a JWT but
+          // it isn't one. Fail open with a loud warning (parallel to the
+          // files onExtractNoMatch "warn" default); this will route
+          // through a per-entry policy once env-var extraction lands.
+          const msg =
+            `[sandbox-runtime] WARNING: credentials.envVars entry ` +
+            `"${v.name}" has decode "jwt" but its value did not verify ` +
+            `as a JWT. The variable is left UNPROTECTED (real value ` +
+            `visible as-is inside the sandbox). Fix the config or remove ` +
+            `the entry.`
+          console.warn(msg)
+          logForDebugging(msg, { level: 'warn' })
+          continue
+        }
+        // JWT-shaped fake so token-parsing tools inside the sandbox keep
+        // working; the proxy swaps the whole fake token on egress. Keyed
+        // env:<NAME> — caller-minted keys stay disjoint from the file:
+        // namespace and from plain masked env vars.
+        setEnvVars[v.name] = sentinelRegistry.registerWithSentinel(
+          'env:' + v.name,
+          mintFakeJwt(randomUUID()),
+          real,
+          injectHosts,
+        )
+        continue
+      }
       setEnvVars[v.name] = sentinelRegistry.register(v.name, real, injectHosts)
     }
   }
