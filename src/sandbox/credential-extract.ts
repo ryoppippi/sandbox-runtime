@@ -68,7 +68,9 @@ interface ReplacementSpan {
  * value is a substring of the sentinel literal. Regex-match spans win
  * over verbatim ones, and verbatim scans run longest-capture-first so a
  * shorter capture that is a substring of a longer one cannot claim part
- * of the longer secret's occurrence.
+ * of the longer secret's occurrence. A capture the callback declined to
+ * mask (returned unchanged — the decode-verification gate) is excluded
+ * from the verbatim scan.
  *
  * Returns `null` when the pattern matches nothing — the caller routes
  * that per the entry's `onExtractNoMatch` option (warn / deny / error).
@@ -123,6 +125,11 @@ export function extractAndSubstitute(
     )
     for (const cap of byLength) {
       const sentinel = sentinelByCapture.get(cap)!
+      // The callback declines masking by returning the capture itself
+      // (decode verification failed). Replacing a value with itself is a
+      // no-op, and its spans must not block other captures' duplicates —
+      // skip declined captures entirely.
+      if (sentinel === cap) continue
       for (
         let start = content.indexOf(cap);
         start !== -1;

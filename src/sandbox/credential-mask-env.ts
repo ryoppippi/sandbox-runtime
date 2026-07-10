@@ -15,7 +15,9 @@
  * {@link CredentialEnvVarConfigSchema}.
  */
 
+import { randomUUID } from 'node:crypto'
 import { logForDebugging } from '../utils/debug.js'
+import { maskJwtClaims, mintFakeJwt, verifyJwt } from './credential-decode.js'
 import { extractAndSubstitute } from './credential-extract.js'
 import type { CredentialEnvVarConfig } from './sandbox-config.js'
 import type { SentinelRegistry } from './credential-sentinel.js'
@@ -62,6 +64,16 @@ export interface MaskedEnvBuildResult {
  *   variable is unset inside the sandbox;
  * - `"error"`: throw, so nothing runs until the regex is fixed.
  *
+ * Decoded mode (`decode: "jwt"`): the whole value is verified as a JWT
+ * and replaced by a JWT-shaped fake registered as a caller-minted
+ * sentinel; with `maskClaims`, each named top-level payload claim present
+ * with a string value gets its own sentinel (keyed `env:<NAME>#<claim>`)
+ * and the token is rebuilt around the modified payload — BOTH the whole
+ * rebuilt token and each claim sentinel are registered under the same
+ * injectHosts. A value that does not verify — or, with `maskClaims`,
+ * verifies but has no named claim present as a string — fails open with a
+ * loud stderr warning.
+ *
  * A masked variable with no value in `env` is skipped — there is nothing
  * to protect, and emitting an unset (or set) var would change tool
  * behaviour (presence checks would flip).
@@ -89,6 +101,77 @@ export function buildMaskedEnvVars(
     // the sandbox can reach — narrow it explicitly when the credential
     // should only go to a subset.
     const injectHosts = v.injectHosts ?? allowedDomains
+
+    if (v.decode === 'jwt') {
+      if (!verifyJwt(real)) {
+        // Nothing was masked — the operator declared the value a JWT but
+        // it isn't one. Fail open with a loud warning (parallel to the
+        // extract onExtractNoMatch "warn" default).
+        const msg =
+          `[sandbox-runtime] WARNING: credentials.envVars entry ` +
+          `"${v.name}" has decode "jwt" but its value did not verify ` +
+          `as a JWT. The variable is left UNPROTECTED (real value ` +
+          `visible as-is inside the sandbox). Fix the config or remove ` +
+          `the entry.`
+        console.warn(msg)
+        logForDebugging(msg, { level: 'warn' })
+        continue
+      }
+      if (v.maskClaims?.length) {
+        // Claim-level masking: sentinels go INSIDE the payload; the
+        // rebuilt fake token is itself registered as a sentinel for the
+        // whole real token, so both the bearer path (token sent
+        // verbatim) and the extracted-claim path substitute on egress.
+        const masked = maskJwtClaims(real, v.maskClaims, (claim, value) =>
+          registry.register(
+            `${ENV_EXTRACT_KEY_PREFIX}${v.name}#${claim}`,
+            value,
+            injectHosts,
+          ),
+        )
+        if (masked === null) {
+          // A verified JWT none of whose named claims are present as
+          // strings: nothing was masked — same fail-open posture as a
+          // value that does not verify.
+          const msg =
+            `[sandbox-runtime] WARNING: credentials.envVars entry ` +
+            `"${v.name}" has maskClaims ` +
+            `${JSON.stringify(v.maskClaims)} but none is present as a ` +
+            `string claim in its JWT value. The variable is left ` +
+            `UNPROTECTED (real value visible as-is inside the sandbox). ` +
+            `Fix the config or remove the entry.`
+          console.warn(msg)
+          logForDebugging(msg, { level: 'warn' })
+          continue
+        }
+        const skipped = v.maskClaims.filter(c => !masked.claimSentinels.has(c))
+        if (skipped.length > 0) {
+          logForDebugging(
+            `[credential-mask] env var "${v.name}": maskClaims ` +
+              `${JSON.stringify(skipped)} absent or non-string in the ` +
+              `JWT — skipped.`,
+          )
+        }
+        setEnvVars[v.name] = registry.registerWithSentinel(
+          `${ENV_EXTRACT_KEY_PREFIX}${v.name}`,
+          masked.fakeToken,
+          real,
+          injectHosts,
+        )
+        continue
+      }
+      // JWT-shaped fake so token-parsing tools inside the sandbox keep
+      // working; the proxy swaps the whole fake token on egress. Keyed
+      // env:<NAME> — caller-minted keys stay disjoint from the file:
+      // namespace and from plain masked env vars.
+      setEnvVars[v.name] = registry.registerWithSentinel(
+        `${ENV_EXTRACT_KEY_PREFIX}${v.name}`,
+        mintFakeJwt(randomUUID()),
+        real,
+        injectHosts,
+      )
+      continue
+    }
 
     if (v.extract === undefined) {
       // Whole-value: one sentinel for the entire value.

@@ -767,8 +767,9 @@ function checkDependencies(ripgrepConfig?: {
  * Only explicitly declared sources are restricted: `mode: 'deny'` file
  * entries join the read-deny set, `mode: 'deny'` env vars are unset, and
  * `mode: 'mask'` env vars are set to a fake value (whole-value sentinel,
- * or the real value with extract-captured spans swapped for sentinels)
- * registered in {@link sentinelRegistry} — see {@link buildMaskedEnvVars}.
+ * the real value with extract-captured spans swapped for sentinels, or a
+ * JWT-shaped fake for `decode: 'jwt'` / `maskClaims` entries) registered
+ * in {@link sentinelRegistry} — see {@link buildMaskedEnvVars}.
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
