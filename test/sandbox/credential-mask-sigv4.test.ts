@@ -1,0 +1,544 @@
+/**
+ * End-to-end SigV4 re-signing through the TLS-terminating proxy.
+ *
+ * The client (curl --aws-sigv4, a real independent SigV4 implementation)
+ * holds only the FAKE credentials, exactly like a sandboxed AWS SDK. The
+ * proxy terminates TLS, detects the fake access key id in the credential
+ * scope, and re-signs with the real pair. The local TLS upstream plays
+ * the AWS service: it recomputes the signature from the REAL secret over
+ * the request it received and asserts an exact match.
+ *
+ * The signer itself is pinned by the official test vectors in
+ * aws-sigv4.test.ts; these tests pin the proxy plumbing around it.
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { createServer as createHttpsServer } from 'node:https'
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
+import type { Server, AddressInfo } from 'node:net'
+import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { SentinelRegistry } from '../../src/sandbox/credential-sentinel.js'
+import {
+  AwsPairRegistry,
+  createSigv4Planner,
+} from '../../src/sandbox/credential-aws-pairs.js'
+import {
+  parseSigv4Authorization,
+  sha256Hex,
+  signSigv4,
+  singleHeader,
+  UNSIGNED_PAYLOAD,
+} from '../../src/sandbox/aws-sigv4.js'
+import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
+import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
+import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
+import type { Sigv4Config } from '../../src/sandbox/sandbox-config.js'
+
+const FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
+const CA_CERT = join(FIXTURE_DIR, 'ca.crt')
+const CA_KEY = join(FIXTURE_DIR, 'ca.key')
+const CA_PEM = readFileSync(CA_CERT, 'utf8')
+
+const REAL_AKID = 'AKIAIOSFODNN7EXAMPLE'
+const REAL_SECRET = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+const REAL_TOKEN = 'FQoGZXIvYXdzEXAMPLEsessiontoken=='
+const REGION = 'us-east-1'
+const SERVICE = 's3'
+const DEST = '127.0.0.1'
+
+/** Host matcher for tests: exact equality. */
+const eq = (h: string, p: string) => h === p
+
+interface Captured {
+  method: string
+  url: string
+  headers: IncomingHttpHeaders
+  body: Buffer
+}
+
+/**
+ * "AWS-side" verification: recompute the signature from the REAL secret
+ * over the request exactly as the upstream received it, and compare.
+ */
+function verifyUpstreamSignature(
+  captured: Captured,
+  opts: { secret?: string; akid?: string } = {},
+): void {
+  const auth = parseSigv4Authorization(
+    singleHeader(captured.headers.authorization)!,
+  )
+  expect(auth).not.toBeNull()
+  expect(auth!.accessKeyId).toBe(opts.akid ?? REAL_AKID)
+  const contentSha = singleHeader(captured.headers['x-amz-content-sha256'])
+  const payloadHash =
+    contentSha === UNSIGNED_PAYLOAD
+      ? UNSIGNED_PAYLOAD
+      : sha256Hex(captured.body)
+  const expected = signSigv4({
+    method: captured.method,
+    requestTarget: captured.url,
+    headers: captured.headers,
+    hostHeader: singleHeader(captured.headers.host)!,
+    signedHeaders: auth!.signedHeaders,
+    payloadHash,
+    amzDate: singleHeader(captured.headers['x-amz-date'])!,
+    scope: { date: auth!.date, region: auth!.region, service: auth!.service },
+    accessKeyId: auth!.accessKeyId,
+    secretAccessKey: opts.secret ?? REAL_SECRET,
+  })
+  expect(auth!.signature).toBe(expected.signature)
+}
+
+type CurlResult = { exit: number; status: number; body: string }
+
+async function curlViaProxy(
+  proxyPort: number,
+  url: string,
+  opts: {
+    headers?: string[]
+    method?: string
+    data?: string
+    awsSigv4?: { akid: string; secret: string }
+  } = {},
+): Promise<CurlResult> {
+  const args = [
+    '-sS',
+    '--proxy',
+    `http://127.0.0.1:${proxyPort}`,
+    '--max-time',
+    '10',
+    '-D',
+    '-',
+    '--cacert',
+    CA_CERT,
+  ]
+  if (opts.method) args.push('-X', opts.method)
+  if (opts.data !== undefined) args.push('--data-binary', opts.data)
+  if (opts.awsSigv4) {
+    args.push(
+      '--aws-sigv4',
+      `aws:amz:${REGION}:${SERVICE}`,
+      '--user',
+      `${opts.awsSigv4.akid}:${opts.awsSigv4.secret}`,
+    )
+  }
+  for (const h of opts.headers ?? []) args.push('-H', h)
+  args.push(url)
+
+  const child = spawn('curl', args)
+  let out = ''
+  let err = ''
+  child.stdout.setEncoding('utf8').on('data', c => (out += c))
+  child.stderr.setEncoding('utf8').on('data', c => (err += c))
+  await Promise.all([
+    new Promise<void>(r => child.stdout.once('end', r)),
+    new Promise<void>(r => child.stderr.once('end', r)),
+  ])
+  const exit = await new Promise<number>(r =>
+    child.on('close', code => r(code ?? 1)),
+  )
+  const sep = out.lastIndexOf('\r\n\r\n')
+  const headerPart = sep >= 0 ? out.slice(0, sep) : out
+  const body = sep >= 0 ? out.slice(sep + 4) : ''
+  const blocks = headerPart.split(/\r\n\r\n/)
+  const m = /HTTP\/[\d.]+ (\d+)/.exec(blocks[blocks.length - 1] ?? '')
+  return { exit, status: m ? Number(m[1]) : 0, body: body || err }
+}
+
+/** One TLS upstream + one terminating proxy with the given SigV4 config. */
+function makeStack(opts: { sigv4?: Sigv4Config; sessionToken?: boolean }) {
+  const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
+  const sentinels = new SentinelRegistry()
+  const pairs = new AwsPairRegistry()
+  const fakeAkid = sentinels.register('AWS_ACCESS_KEY_ID', REAL_AKID, [DEST])
+  const fakeSecret = sentinels.register('AWS_SECRET_ACCESS_KEY', REAL_SECRET, [
+    DEST,
+  ])
+  let fakeToken: string | undefined
+  if (opts.sessionToken) {
+    fakeToken = sentinels.register('AWS_SESSION_TOKEN', REAL_TOKEN, [DEST])
+  }
+  pairs.register({
+    accessKeyIdSentinel: fakeAkid,
+    realAccessKeyId: REAL_AKID,
+    realSecretAccessKey: REAL_SECRET,
+    ...(opts.sessionToken ? { realSessionToken: REAL_TOKEN } : {}),
+    injectHosts: [DEST],
+  })
+
+  const state: {
+    ca: ReturnType<typeof createMitmCA>
+    fakeAkid: string
+    fakeSecret: string
+    fakeToken: string | undefined
+    upstream?: Server
+    upstreamPort?: number
+    proxy?: Server
+    proxyPort?: number
+    captured?: Captured
+  } = { ca, fakeAkid, fakeSecret, fakeToken }
+
+  const start = async () => {
+    const upCert = mintLeafCert(ca, DEST)
+    const upLeafOnly = upCert.certPem.match(
+      /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\r?\n?/,
+    )![0]
+    const upstream = createHttpsServer(
+      { cert: upLeafOnly, key: upCert.keyPem },
+      (req: IncomingMessage, res) => {
+        const chunks: Buffer[] = []
+        req.on('data', (c: Buffer) => chunks.push(c))
+        req.on('end', () => {
+          state.captured = {
+            method: req.method!,
+            url: req.url!,
+            headers: req.headers,
+            body: Buffer.concat(chunks),
+          }
+          res.writeHead(200, { 'content-type': 'text/plain' })
+          res.end('ok')
+        })
+      },
+    )
+    await new Promise<void>(r => upstream.listen(0, DEST, r))
+    state.upstream = upstream
+    state.upstreamPort = (upstream.address() as AddressInfo).port
+
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: ca,
+      tlsTerminateUpstreamCA: CA_PEM,
+      mutateHeaders: (headers, destHost) =>
+        sentinels.substituteInHeaders(headers, destHost, eq),
+      planSigv4: createSigv4Planner(pairs, opts.sigv4, eq),
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    state.proxy = proxy
+    state.proxyPort = (proxy.address() as AddressInfo).port
+  }
+
+  const stop = async () => {
+    if (state.proxy) {
+      await new Promise<void>(r => state.proxy!.close(() => r()))
+    }
+    if (state.upstream) {
+      await new Promise<void>(r => state.upstream!.close(() => r()))
+    }
+    await disposeMitmCA(ca)
+  }
+
+  return { state, start, stop }
+}
+
+describe('SigV4 re-signing through the TLS-terminating proxy', () => {
+  const stack = makeStack({ sessionToken: true })
+  const { state } = stack
+
+  beforeAll(stack.start)
+  afterAll(stack.stop)
+
+  test('curl --aws-sigv4 with fake creds: upstream sees a valid real-credential signature', async () => {
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/key?list-type=2&prefix=a%20b`,
+      { awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret } },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured).toBeDefined()
+
+    // The scope carries the REAL access key id...
+    const auth = singleHeader(captured.headers.authorization)!
+    expect(auth).toContain(`Credential=${REAL_AKID}/`)
+    expect(auth).toContain(`/${REGION}/${SERVICE}/aws4_request`)
+    // ...and the signature verifies against the REAL secret over the
+    // request as received (the upstream's own recomputation).
+    verifyUpstreamSignature(captured)
+    // Nothing fake leaked upstream.
+    expect(JSON.stringify(captured.headers)).not.toContain(state.fakeAkid)
+    expect(JSON.stringify(captured.headers)).not.toContain(state.fakeSecret)
+  }, 20000)
+
+  test('POST with a body: hash recomputed over the forwarded bytes, body intact', async () => {
+    state.captured = undefined
+    const body = 'Param1=value1&Param2=value2'
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      {
+        awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret },
+        data: body,
+        headers: ['Content-Type: application/x-www-form-urlencoded'],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.toString()).toBe(body)
+    // curl signs the body hash without emitting x-amz-content-sha256, so
+    // the proxy had to buffer the body and recompute the hash itself —
+    // the recomputed signature only verifies if it covers sha256(body).
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
+  test('the real session token is injected and covered by the signature', async () => {
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      { awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret } },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(singleHeader(captured.headers['x-amz-security-token'])).toBe(
+      REAL_TOKEN,
+    )
+    const auth = parseSigv4Authorization(
+      singleHeader(captured.headers.authorization)!,
+    )!
+    expect(auth.signedHeaders).toContain('x-amz-security-token')
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
+  test('UNSIGNED-PAYLOAD: re-signed without hashing the body', async () => {
+    // Hand-signed client request (curl --aws-sigv4 always hashes), using
+    // the vector-pinned signer with the FAKE credentials — the same
+    // bytes a real SDK configured for UNSIGNED-PAYLOAD would produce.
+    state.captured = undefined
+    const amzDate = '20260715T000000Z'
+    const hostHeader = `${DEST}:${state.upstreamPort}`
+    const headers: IncomingHttpHeaders = {
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': UNSIGNED_PAYLOAD,
+    }
+    const { authorization } = signSigv4({
+      method: 'PUT',
+      requestTarget: '/bucket/key',
+      headers,
+      hostHeader,
+      signedHeaders: ['host', 'x-amz-date', 'x-amz-content-sha256'],
+      payloadHash: UNSIGNED_PAYLOAD,
+      amzDate,
+      scope: { date: '20260715', region: REGION, service: SERVICE },
+      accessKeyId: state.fakeAkid,
+      secretAccessKey: state.fakeSecret,
+    })
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/key`,
+      {
+        method: 'PUT',
+        data: 'streamed-bytes',
+        headers: [
+          `Authorization: ${authorization}`,
+          `X-Amz-Date: ${amzDate}`,
+          `X-Amz-Content-Sha256: ${UNSIGNED_PAYLOAD}`,
+        ],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.toString()).toBe('streamed-bytes')
+    // Marker preserved; signature covers the marker, not a body hash.
+    expect(singleHeader(captured.headers['x-amz-content-sha256'])).toBe(
+      UNSIGNED_PAYLOAD,
+    )
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
+  test('an AWS-shaped request with unmasked credentials is untouched', async () => {
+    state.captured = undefined
+    const otherAkid = 'AKIDUNRELATEDEXAMPLE'
+    const otherSecret = 'unrelated-real-secret-the-proxy-never-saw'
+    const amzDate = '20260715T000000Z'
+    const { authorization } = signSigv4({
+      method: 'GET',
+      requestTarget: '/',
+      headers: { 'x-amz-date': amzDate },
+      hostHeader: `${DEST}:${state.upstreamPort}`,
+      signedHeaders: ['host', 'x-amz-date'],
+      payloadHash: sha256Hex(''),
+      amzDate,
+      scope: { date: '20260715', region: REGION, service: SERVICE },
+      accessKeyId: otherAkid,
+      secretAccessKey: otherSecret,
+    })
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      {
+        headers: [`Authorization: ${authorization}`, `X-Amz-Date: ${amzDate}`],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    // Byte-identical Authorization upstream: never rewritten, never denied.
+    expect(singleHeader(state.captured!.headers.authorization)).toBe(
+      authorization,
+    )
+    verifyUpstreamSignature(state.captured!, {
+      akid: otherAkid,
+      secret: otherSecret,
+    })
+  }, 20000)
+
+  test('a non-AWS request with a masked sentinel still gets plain substitution', async () => {
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      { headers: [`X-Api-Key: ${state.fakeAkid}`] },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    expect(singleHeader(state.captured!.headers['x-api-key'])).toBe(REAL_AKID)
+  }, 20000)
+})
+
+describe('policies for non-re-signable SigV4 shapes', () => {
+  function streamingHeaders(fakeAkid: string): string[] {
+    return [
+      `Authorization: AWS4-HMAC-SHA256 Credential=${fakeAkid}/20260715/${REGION}/${SERVICE}/aws4_request, ` +
+        'SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ff00',
+      'X-Amz-Date: 20260715T000000Z',
+      'X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+      'Content-Encoding: aws-chunked',
+    ]
+  }
+  function sigv4aHeaders(fakeAkid: string): string[] {
+    return [
+      `Authorization: AWS4-ECDSA-P256-SHA256 Credential=${fakeAkid}/20260715/${SERVICE}/aws4_request, ` +
+        'SignedHeaders=host;x-amz-date;x-amz-region-set, Signature=ff00',
+      'X-Amz-Date: 20260715T000000Z',
+      'X-Amz-Region-Set: *',
+    ]
+  }
+  function presignedTarget(fakeAkid: string): string {
+    return (
+      '/key?X-Amz-Algorithm=AWS4-HMAC-SHA256' +
+      `&X-Amz-Credential=${encodeURIComponent(`${fakeAkid}/20260715/${REGION}/${SERVICE}/aws4_request`)}` +
+      '&X-Amz-Date=20260715T000000Z&X-Amz-Expires=3600' +
+      '&X-Amz-SignedHeaders=host&X-Amz-Signature=ff00'
+    )
+  }
+
+  describe('default: deny with a clear error naming the case', () => {
+    const stack = makeStack({})
+    const { state } = stack
+    beforeAll(stack.start)
+    afterAll(stack.stop)
+
+    test('streaming', async () => {
+      state.captured = undefined
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}/bucket/key`,
+        {
+          method: 'PUT',
+          data: 'chunked',
+          headers: streamingHeaders(state.fakeAkid),
+        },
+      )
+      expect(r.status).toBe(403)
+      expect(r.body).toContain('streaming')
+      expect(r.body).toContain('credentials.sigv4.streaming')
+      expect(state.captured).toBeUndefined()
+    }, 20000)
+
+    test('presigned', async () => {
+      state.captured = undefined
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}${presignedTarget(state.fakeAkid)}`,
+      )
+      expect(r.status).toBe(403)
+      expect(r.body).toContain('presigned')
+      expect(r.body).toContain('credentials.sigv4.presigned')
+      expect(state.captured).toBeUndefined()
+    }, 20000)
+
+    test('sigv4a', async () => {
+      state.captured = undefined
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}/`,
+        { headers: sigv4aHeaders(state.fakeAkid) },
+      )
+      expect(r.status).toBe(403)
+      expect(r.body).toContain('sigv4a')
+      expect(r.body).toContain('credentials.sigv4.sigv4a')
+      expect(state.captured).toBeUndefined()
+    }, 20000)
+
+    test('a presigned URL with an unmasked key id is not denied', async () => {
+      state.captured = undefined
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}${presignedTarget('AKIDUNRELATEDEXAMPLE')}`,
+      )
+      expect(r.status).toBe(200)
+      expect(state.captured).toBeDefined()
+    }, 20000)
+  })
+
+  describe('passthrough when configured', () => {
+    const stack = makeStack({
+      sigv4: {
+        streaming: 'passthrough',
+        presigned: 'passthrough',
+        sigv4a: 'passthrough',
+      },
+    })
+    const { state } = stack
+    beforeAll(stack.start)
+    afterAll(stack.stop)
+
+    test('each shape is forwarded un-resigned', async () => {
+      // streaming
+      state.captured = undefined
+      let r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}/bucket/key`,
+        {
+          method: 'PUT',
+          data: 'chunked',
+          headers: streamingHeaders(state.fakeAkid),
+        },
+      )
+      expect(r.status).toBe(200)
+      let auth = singleHeader(state.captured!.headers.authorization)!
+      // Not re-signed: the client's fake-secret signature survives (and
+      // will fail at a real upstream). Ordinary sentinel substitution
+      // still ran on the header text.
+      expect(auth).toContain('Signature=ff00')
+      expect(auth).toContain(`Credential=${REAL_AKID}/`)
+
+      // presigned
+      state.captured = undefined
+      r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}${presignedTarget(state.fakeAkid)}`,
+      )
+      expect(r.status).toBe(200)
+      expect(state.captured!.url).toContain('X-Amz-Signature=ff00')
+
+      // sigv4a
+      state.captured = undefined
+      r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}/`,
+        { headers: sigv4aHeaders(state.fakeAkid) },
+      )
+      expect(r.status).toBe(200)
+      auth = singleHeader(state.captured!.headers.authorization)!
+      expect(auth).toStartWith('AWS4-ECDSA-P256-SHA256')
+      expect(auth).toContain('Signature=ff00')
+    }, 30000)
+  })
+})
