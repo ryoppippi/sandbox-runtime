@@ -23,11 +23,14 @@ import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  respondDenied,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
+import { sha256Hex } from './aws-sigv4.js'
+import type { PlanSigv4 } from './credential-aws-pairs.js'
 
 /**
  * True if `buf` starts with a TLS Handshake record header.
@@ -120,6 +123,7 @@ export function terminateAndForward(
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
+  planSigv4?: PlanSigv4,
 ): void {
   // ALPN advertises HTTP/1.1 only — terminating HTTP/2 would require a frame
   // parser; clients negotiate down. The base secureContext covers clients
@@ -139,7 +143,14 @@ export function terminateAndForward(
   })
 
   inner.on('request', (req, res) => {
-    void forwardUpstream(filterRequest, mutateHeaders, req, res, target)
+    void forwardUpstream(
+      filterRequest,
+      mutateHeaders,
+      req,
+      res,
+      target,
+      planSigv4,
+    )
   })
   inner.on('tlsClientError', (err, sock) => {
     logForDebugging(
@@ -201,6 +212,7 @@ async function forwardUpstream(
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
+  planSigv4?: PlanSigv4,
 ): Promise<void> {
   // req.url is the request-target verbatim. Inside a CONNECT tunnel almost
   // every client sends origin-form (`/path?q`), but RFC 7230 §5.3.2 also
@@ -250,11 +262,54 @@ async function forwardUpstream(
   // correct verification under both Node and Bun.
   const fwdHeaders = stripHopByHop(req.headers)
   delete fwdHeaders.host
+  // SigV4 planning reads the ORIGINAL headers: the trigger is the fake
+  // (masked) access key id in the signature's credential scope, which the
+  // header substitution below would already have replaced.
+  const sigv4Plan = planSigv4?.(
+    req.method ?? 'GET',
+    path,
+    req.headers,
+    target.hostname,
+  )
   // Header mutation runs after the allow decision and before httpsRequest.
   // The upstream TLS handshake (rejectUnauthorized defaults to true)
   // completes before any HTTP bytes are written, so mutated headers never
   // reach an unverified server.
   mutateHeaders?.(fwdHeaders, target.hostname)
+
+  // SigV4 re-signing runs after substitution so the new signature covers
+  // the headers as they actually go upstream (real access key id, real
+  // session token). Same denial surface as filterRequest.
+  let bufferedBody: Buffer | undefined
+  if (sigv4Plan?.action === 'deny') {
+    respondDenied(res, sigv4Plan.reason)
+    body.destroy()
+    return
+  }
+  if (sigv4Plan?.action === 'resign') {
+    let payloadHash = sigv4Plan.payloadHash
+    if (payloadHash === undefined) {
+      // The client signed a literal body hash: buffer the body and
+      // recompute so the signature covers the bytes actually sent.
+      try {
+        bufferedBody = await collectBody(body)
+      } catch (err) {
+        logForDebugging(
+          `[tls-terminate] failed to buffer body for SigV4 re-sign: ${(err as Error).message}`,
+          { level: 'error' },
+        )
+        res.destroy()
+        return
+      }
+      payloadHash = sha256Hex(bufferedBody)
+    }
+    // Mirror the Host value the runtime derives from {host, port} below.
+    const bracketedHost =
+      isIP(target.hostname) === 6 ? `[${target.hostname}]` : target.hostname
+    const hostHeader =
+      target.port === 443 ? bracketedHost : `${bracketedHost}:${target.port}`
+    sigv4Plan.apply(fwdHeaders, hostHeader, payloadHash)
+  }
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
   const upstream = httpsRequest(
@@ -298,7 +353,21 @@ async function forwardUpstream(
   })
 
   res.on('close', () => upstream.destroy())
-  body.pipe(upstream)
+  if (bufferedBody !== undefined) {
+    upstream.end(bufferedBody)
+  } else {
+    body.pipe(upstream)
+  }
+}
+
+/** Read a request body fully into memory (for SigV4 body-hash re-signing). */
+function collectBody(body: Readable): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    body.on('data', (c: Buffer) => chunks.push(c))
+    body.once('end', () => resolve(Buffer.concat(chunks)))
+    body.once('error', reject)
+  })
 }
 
 function originFormPath(reqUrl: string | undefined): string {

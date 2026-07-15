@@ -17,6 +17,7 @@ import {
   peekForClientHello,
   terminateAndForward,
 } from './tls-terminate-proxy.js'
+import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -90,6 +91,15 @@ export interface HttpProxyServerOptions {
    * injection over plaintext is opt-in.
    */
   mutateHeadersPlaintext?: MutateForwardedHeaders
+
+  /**
+   * Per-request AWS SigV4 hook on the TLS-terminated path. Runs in
+   * forwardUpstream around `mutateHeaders`: requests whose signature
+   * references a masked credential pair are re-signed with the real
+   * credentials (or denied per policy for shapes that cannot be
+   * re-signed); everything else is untouched. See credential-aws-pairs.ts.
+   */
+  planSigv4?: PlanSigv4
 
   /**
    * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
@@ -203,6 +213,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             socket,
             peeked.head,
             { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+            options.planSigv4,
           )
           return
         }
