@@ -462,12 +462,18 @@ describe.if(isLinux)(
     let upstream: Server
     let upstreamPort: number
     let lastHeaders: IncomingHttpHeaders | undefined
+    let lastBody: string | undefined
 
     beforeAll(async () => {
       upstream = createHttpServer((req, res) => {
         lastHeaders = req.headers
-        res.writeHead(200)
-        res.end('ok')
+        let body = ''
+        req.on('data', c => (body += c))
+        req.on('end', () => {
+          lastBody = body
+          res.writeHead(200)
+          res.end('ok')
+        })
       })
       await new Promise<void>(r => upstream.listen(0, '127.0.0.1', () => r()))
       upstreamPort = (upstream.address() as AddressInfo).port
@@ -512,6 +518,7 @@ describe.if(isLinux)(
       url: string,
       bearer: string,
       resolve?: string,
+      body?: string,
     ): Promise<number> {
       const proxyPort = SandboxManager.getProxyPort()!
       const authToken = SandboxManager.getProxyAuthToken()!
@@ -525,6 +532,7 @@ describe.if(isLinux)(
         `Authorization: Bearer ${bearer}`,
       ]
       if (resolve) args.push('--resolve', resolve)
+      if (body !== undefined) args.push('--data-binary', body)
       args.push(url)
       const child = spawn('curl', args)
       child.stdout.on('data', () => {})
@@ -553,6 +561,28 @@ describe.if(isLinux)(
         sentinel,
       )
       expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${DB_PASSWORD}`)
+    }, 20000)
+
+    test('a sentinel in a POST body reaches the injectHost as the real password', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "printenv ${VAR} | sed -E 's|.*://[^:]+:([^@]+)@.*|\\\\1|'"`,
+      )
+      const sentinel = runInSandbox(wrapped).stdout.trim()
+      expect(sentinel.startsWith(SENTINEL_PREFIX)).toBe(true)
+
+      // Body leg: the tool POSTs the credential in a JSON payload instead
+      // of a header; the manager proxy substitutes in the body stream.
+      lastHeaders = undefined
+      lastBody = undefined
+      const exit = await curlViaManagerProxy(
+        `http://${HOST_A}:${upstreamPort}/`,
+        sentinel,
+        undefined,
+        `{"password":"${sentinel}"}`,
+      )
+      expect(exit).toBe(0)
+      expect(lastBody).toBe(`{"password":"${DB_PASSWORD}"}`)
       expect(lastHeaders?.authorization).toBe(`Bearer ${DB_PASSWORD}`)
     }, 20000)
 
