@@ -154,6 +154,19 @@ describe('prepareBodySubstitution', () => {
     expect(fwd['content-length']).toBe('10')
   })
 
+  test('GET that declares a body still gets the transform', () => {
+    // GET-with-body APIs are legal HTTP and forwarded; only a GET with no
+    // declared body keeps the bare pipe.
+    const fwd: IncomingHttpHeaders = { 'content-length': '10' }
+    const t = prepareBodySubstitution(
+      () => [pair(SENTINEL, REAL)],
+      msg('GET', { 'content-length': '10' }),
+      fwd,
+      'h',
+    )
+    expect(t).toBeDefined()
+  })
+
   test('no injectable pairs at the host → no transform, headers untouched', () => {
     const fwd: IncomingHttpHeaders = { 'content-length': '10' }
     expect(

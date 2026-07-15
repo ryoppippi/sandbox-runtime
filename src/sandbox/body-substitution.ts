@@ -62,7 +62,15 @@ export function prepareBodySubstitution(
   destHost: string,
 ): Transform | undefined {
   if (getBodySubstitutions === undefined) return undefined
-  if (BODYLESS_METHODS.has(req.method ?? 'GET')) return undefined
+  // A bodyless-method request can still carry a declared body (GET-with-body
+  // APIs are legal HTTP and forwarded today) — skip only when there is
+  // provably nothing to scan.
+  const declaresBody =
+    req.headers['content-length'] !== undefined ||
+    req.headers['transfer-encoding'] !== undefined
+  if (BODYLESS_METHODS.has(req.method ?? 'GET') && !declaresBody) {
+    return undefined
+  }
   const pairs = getBodySubstitutions(destHost)
   if (!pairs?.length) return undefined
   if (req.headers['content-encoding'] !== undefined) {
