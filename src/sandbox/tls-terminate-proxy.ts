@@ -262,13 +262,16 @@ async function forwardUpstream(
   // correct verification under both Node and Bun.
   const fwdHeaders = stripHopByHop(req.headers)
   delete fwdHeaders.host
-  // SigV4 planning reads the ORIGINAL headers: the trigger is the fake
-  // (masked) access key id in the signature's credential scope, which the
-  // header substitution below would already have replaced.
+  // SigV4 planning runs on the PRE-substitution headers (the trigger is
+  // the fake access key id in the credential scope, which the header
+  // substitution below replaces) but on the POST-strip view: the plan's
+  // signed-header presence check must see exactly the set that will be
+  // signed and forwarded, or a signed hop-by-hop header would pass the
+  // check and then blow up inside the signer.
   const sigv4Plan = planSigv4?.(
     req.method ?? 'GET',
     path,
-    req.headers,
+    fwdHeaders,
     target.hostname,
   )
   // Header mutation runs after the allow decision and before httpsRequest.
@@ -308,7 +311,18 @@ async function forwardUpstream(
       isIP(target.hostname) === 6 ? `[${target.hostname}]` : target.hostname
     const hostHeader =
       target.port === 443 ? bracketedHost : `${bracketedHost}:${target.port}`
-    sigv4Plan.apply(fwdHeaders, hostHeader, payloadHash)
+    try {
+      sigv4Plan.apply(fwdHeaders, hostHeader, payloadHash)
+    } catch (err) {
+      // Fail closed on any signer error — a request the proxy claimed to
+      // handle must not go upstream half-rewritten, and a client-crafted
+      // header set must not become an unhandled rejection.
+      respondDenied(
+        res,
+        `AWS SigV4 re-signing failed: ${(err as Error).message}`,
+      )
+      return
+    }
   }
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.

@@ -388,6 +388,38 @@ describe('SigV4 re-signing through the TLS-terminating proxy', () => {
     })
   }, 20000)
 
+  test('a signed hop-by-hop header fails closed instead of crashing the proxy', async () => {
+    // The client lists a header in SignedHeaders that it also declares
+    // hop-by-hop via Connection, so the proxy strips it before signing.
+    // The plan must see the post-strip header set and deny — not throw
+    // inside the signer after claiming the request.
+    state.captured = undefined
+    const amzDate = '20260715T000000Z'
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      {
+        headers: [
+          `Authorization: AWS4-HMAC-SHA256 Credential=${state.fakeAkid}/20260715/${REGION}/${SERVICE}/aws4_request, ` +
+            'SignedHeaders=host;x-amz-date;x-custom, Signature=ff00',
+          `X-Amz-Date: ${amzDate}`,
+          'Connection: x-custom',
+          'X-Custom: value',
+        ],
+      },
+    )
+    expect(r.status).toBe(403)
+    expect(r.body).toContain('x-custom')
+    expect(state.captured).toBeUndefined()
+    // The proxy survived: a follow-up request still works.
+    const r2 = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      { awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret } },
+    )
+    expect(r2.status).toBe(200)
+  }, 20000)
+
   test('a non-AWS request with a masked sentinel still gets plain substitution', async () => {
     state.captured = undefined
     const r = await curlViaProxy(
