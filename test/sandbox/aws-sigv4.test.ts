@@ -322,4 +322,40 @@ describe('detectSigv4 classification', () => {
     // Query mentions X-Amz-Signature but not the SigV4 algorithm.
     expect(detectSigv4({}, '/?X-Amz-Signature=ff00')).toBeNull()
   })
+
+  test('a non-AWS Authorization header does not hide a presigned query', () => {
+    const target =
+      '/key?X-Amz-Algorithm=AWS4-HMAC-SHA256' +
+      `&X-Amz-Credential=${encodeURIComponent(`${AKID}/20150830/us-east-1/s3/aws4_request`)}` +
+      '&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600' +
+      '&X-Amz-SignedHeaders=host&X-Amz-Signature=ff00'
+    // Junk Authorization values must not exempt the query from
+    // classification, or the presigned policy could be bypassed by
+    // adding one alongside the presigned sentinel params.
+    for (const authorization of [
+      'Basic dXNlcjpwYXNz',
+      'Bearer abc',
+      // Starts with the SigV4 algorithm but carries no Credential scope.
+      'AWS4-HMAC-SHA256 garbage',
+      // SigV4A shape without a parsable Credential.
+      'AWS4-ECDSA-P256-SHA256 garbage',
+    ]) {
+      expect(detectSigv4({ authorization }, target)).toEqual({
+        kind: 'presigned',
+        accessKeyId: AKID,
+      })
+    }
+  })
+
+  test('a classifiable header signature wins over a presigned query', () => {
+    const queryAkid = 'AKIDQUERYEXAMPLE'
+    const target =
+      '/key?X-Amz-Algorithm=AWS4-HMAC-SHA256' +
+      `&X-Amz-Credential=${encodeURIComponent(`${queryAkid}/20150830/us-east-1/s3/aws4_request`)}` +
+      '&X-Amz-Signature=ff00'
+    expect(detectSigv4({ authorization: HEADER_AUTH }, target)).toEqual({
+      kind: 'header-sigv4',
+      accessKeyId: AKID,
+    })
+  })
 })

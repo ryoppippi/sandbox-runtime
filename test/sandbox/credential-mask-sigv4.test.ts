@@ -517,6 +517,31 @@ describe('policies for non-re-signable SigV4 shapes', () => {
       expect(r.status).toBe(200)
       expect(state.captured).toBeDefined()
     }, 20000)
+
+    test('a junk Authorization header does not bypass the presigned policy', async () => {
+      state.captured = undefined
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}${presignedTarget(state.fakeAkid)}`,
+        { headers: ['Authorization: Basic dXNlcjpwYXNz'] },
+      )
+      expect(r.status).toBe(403)
+      expect(r.body).toContain('presigned')
+      expect(state.captured).toBeUndefined()
+    }, 20000)
+
+    test('junk Authorization + unmasked presigned query stays untouched', async () => {
+      state.captured = undefined
+      const junkAuth = 'Basic dXNlcjpwYXNz'
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}${presignedTarget('AKIDUNRELATEDEXAMPLE')}`,
+        { headers: [`Authorization: ${junkAuth}`] },
+      )
+      expect(r.status).toBe(200)
+      expect(singleHeader(state.captured!.headers.authorization)).toBe(junkAuth)
+      expect(state.captured!.url).toContain('X-Amz-Signature=ff00')
+    }, 20000)
   })
 
   describe('passthrough when configured', () => {

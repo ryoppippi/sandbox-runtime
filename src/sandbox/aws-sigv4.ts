@@ -32,9 +32,11 @@ export const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
  * - `streaming`: `x-amz-content-sha256` declares an aws-chunked payload
  *   (`STREAMING-*`) whose chunk signatures chain off the seed signature —
  *   re-signing would require rewriting the body's per-chunk signatures.
- * - `presigned`: no Authorization header; the signature lives in the query
- *   (`X-Amz-Algorithm` / `X-Amz-Signature`) — re-signing would rewrite the
- *   URL itself.
+ * - `presigned`: the signature lives in the query (`X-Amz-Algorithm` /
+ *   `X-Amz-Signature`) — re-signing would rewrite the URL itself. Applies
+ *   whenever the Authorization header does not itself classify: a non-AWS
+ *   Authorization value (e.g. `Basic ...`) must not exempt the query, or
+ *   adding a junk header would bypass the presigned policy.
  * - `sigv4a`: Authorization is `AWS4-ECDSA-P256-SHA256 ...` — asymmetric
  *   signing keyed off the secret via ECDSA; there is no shared-key HMAC to
  *   recompute without the client's derived private key.
@@ -62,14 +64,12 @@ export function detectSigv4(
   requestTarget: string,
 ): Sigv4Detection | null {
   const auth = singleHeader(headers.authorization)
-  if (auth !== undefined) {
-    if (auth.startsWith(SIGV4A_ALGORITHM)) {
-      const akid = credentialAccessKeyId(auth)
-      return akid === undefined ? null : { kind: 'sigv4a', accessKeyId: akid }
-    }
-    if (auth.startsWith(SIGV4_ALGORITHM)) {
-      const akid = credentialAccessKeyId(auth)
-      if (akid === undefined) return null
+  if (auth !== undefined && auth.startsWith(SIGV4A_ALGORITHM)) {
+    const akid = credentialAccessKeyId(auth)
+    if (akid !== undefined) return { kind: 'sigv4a', accessKeyId: akid }
+  } else if (auth !== undefined && auth.startsWith(SIGV4_ALGORITHM)) {
+    const akid = credentialAccessKeyId(auth)
+    if (akid !== undefined) {
       const contentSha = singleHeader(headers['x-amz-content-sha256'])
       // Covers STREAMING-AWS4-HMAC-SHA256-PAYLOAD, its -TRAILER variant,
       // and STREAMING-UNSIGNED-PAYLOAD-TRAILER: all declare an aws-chunked
@@ -79,10 +79,12 @@ export function detectSigv4(
         : 'header-sigv4'
       return { kind, accessKeyId: akid }
     }
-    return null
   }
 
-  // Presigned URL: the signature is in the query string.
+  // Presigned URL: the signature is in the query string. Checked whenever
+  // the Authorization header did not classify above — an unrecognized or
+  // malformed Authorization value alongside presigned sentinel params must
+  // not turn the request invisible to the presigned policy.
   const q = requestTarget.indexOf('?')
   if (q === -1) return null
   const params = new URLSearchParams(requestTarget.slice(q + 1))
