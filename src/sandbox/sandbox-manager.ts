@@ -79,6 +79,7 @@ import {
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
+import type { GetBodySubstitutions } from './body-substitution.js'
 import {
   canonicalizeHost,
   isValidHost,
@@ -270,6 +271,17 @@ function buildCredentialInjector(): MutateForwardedHeaders | undefined {
 }
 
 /**
+ * Body counterpart of {@link buildCredentialInjector}: per-destination
+ * sentinel→real pairs for streaming substitution in request bodies, with
+ * the same per-credential injectHosts gating applied inside the registry.
+ */
+function buildBodyCredentialInjector(): GetBodySubstitutions | undefined {
+  if (!config?.credentials) return undefined
+  return destHost =>
+    sentinelRegistry.sentinelsForHost(destHost, matchesDomainPattern)
+}
+
+/**
  * Build the per-request SigV4 hook for the TLS-terminating proxy.
  * Returns undefined when no `credentials` block is configured. The hook
  * consults {@link awsPairRegistry} at request time, so pairs registered
@@ -353,6 +365,7 @@ async function startMuxProxyServer(
   portRange: readonly [number, number] | undefined,
 ): Promise<number> {
   const injectCredentials = buildCredentialInjector()
+  const injectBodyCredentials = buildBodyCredentialInjector()
   httpProxyServer = createHttpProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
@@ -366,6 +379,10 @@ async function startMuxProxyServer(
     mutateHeaders: injectCredentials,
     mutateHeadersPlaintext: config?.credentials?.allowPlaintextInject
       ? injectCredentials
+      : undefined,
+    getBodySubstitutions: injectBodyCredentials,
+    getBodySubstitutionsPlaintext: config?.credentials?.allowPlaintextInject
+      ? injectBodyCredentials
       : undefined,
     // SigV4 re-signing is TLS-terminated-path only, like credential
     // injection: the real signature must not travel over plaintext.

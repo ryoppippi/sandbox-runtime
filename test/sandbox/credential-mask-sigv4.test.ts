@@ -158,6 +158,8 @@ function makeStack(opts: {
   sigv4?: Sigv4Config
   sessionToken?: boolean
   maxSigv4ResignBodyBytes?: number
+  /** Also wire request-BODY sentinel substitution (body-substitution.ts). */
+  bodySubstitution?: boolean
 }) {
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const sentinels = new SentinelRegistry()
@@ -180,6 +182,7 @@ function makeStack(opts: {
 
   const state: {
     ca: ReturnType<typeof createMitmCA>
+    sentinels: SentinelRegistry
     fakeAkid: string
     fakeSecret: string
     fakeToken: string | undefined
@@ -188,7 +191,7 @@ function makeStack(opts: {
     proxy?: Server
     proxyPort?: number
     captured?: Captured
-  } = { ca, fakeAkid, fakeSecret, fakeToken }
+  } = { ca, sentinels, fakeAkid, fakeSecret, fakeToken }
 
   const start = async () => {
     const upCert = mintLeafCert(ca, DEST)
@@ -222,6 +225,12 @@ function makeStack(opts: {
       tlsTerminateUpstreamCA: CA_PEM,
       mutateHeaders: (headers, destHost) =>
         sentinels.substituteInHeaders(headers, destHost, eq),
+      ...(opts.bodySubstitution
+        ? {
+            getBodySubstitutions: (destHost: string) =>
+              sentinels.sentinelsForHost(destHost, eq),
+          }
+        : {}),
       planSigv4: createSigv4Planner(pairs, opts.sigv4, eq),
       ...(opts.maxSigv4ResignBodyBytes !== undefined
         ? { maxSigv4ResignBodyBytes: opts.maxSigv4ResignBodyBytes }
@@ -686,4 +695,82 @@ describe('policies for non-re-signable SigV4 shapes', () => {
       expect(auth).toContain('Signature=ff00')
     }, 30000)
   })
+})
+
+describe('body substitution composes with SigV4 re-signing', () => {
+  // Ordering contract under test: when a literal-hash SigV4 request
+  // carries body-injectable sentinels, the proxy buffers the SUBSTITUTED
+  // stream (body → bodyTransform → collectBody), hashes that, and signs —
+  // the signature must cover the bytes actually sent upstream, never the
+  // sentinel-bearing bytes the client wrote.
+  const stack = makeStack({ bodySubstitution: true })
+  const { state } = stack
+  beforeAll(stack.start)
+  afterAll(stack.stop)
+
+  test('literal-hash POST: recomputed hash covers the substituted body (length-matched)', async () => {
+    // Real value ≥ 47 bytes → the sentinel is padded to the same length,
+    // so substitution cannot change the body length.
+    const real = 'real-api-token-' + 'x'.repeat(45)
+    const fake = state.sentinels.register('API_TOKEN_LONG', real, [DEST])
+    expect(fake.length).toBe(real.length)
+
+    state.captured = undefined
+    const body = JSON.stringify({ token: fake, note: 'sentinel in body' })
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/compose/long`,
+      {
+        awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret },
+        data: body,
+        headers: ['Content-Type: application/json'],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    // Body substitution ran: upstream got the REAL token, never the fake.
+    expect(captured.body.toString()).toContain(real)
+    expect(captured.body.toString()).not.toContain(fake)
+    // Length-matched → framing untouched.
+    expect(singleHeader(captured.headers['content-length'])).toBe(
+      String(Buffer.byteLength(body)),
+    )
+    // The crux: verifyUpstreamSignature recomputes the hash over the
+    // body AS RECEIVED (post-substitution); the proxy's signature only
+    // verifies if it hashed the substituted bytes too.
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
+  test('literal-hash POST: short secret re-frames; signature and Content-Length track the substituted body', async () => {
+    // Real value < 47 bytes → the sentinel is longer than the real value,
+    // substitution shrinks the body, and the buffered length becomes the
+    // outgoing Content-Length.
+    const real = 'short-real-token'
+    const fake = state.sentinels.register('API_TOKEN_SHORT', real, [DEST])
+    expect(fake.length).toBeGreaterThan(real.length)
+
+    state.captured = undefined
+    const body = JSON.stringify({ token: fake })
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/compose/short`,
+      {
+        awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret },
+        data: body,
+        headers: ['Content-Type: application/json'],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.toString()).toContain(real)
+    expect(captured.body.toString()).not.toContain(fake)
+    // Re-framed to the substituted (shorter) length, not the client's.
+    expect(captured.body.length).toBeLessThan(Buffer.byteLength(body))
+    expect(singleHeader(captured.headers['content-length'])).toBe(
+      String(captured.body.length),
+    )
+    verifyUpstreamSignature(captured)
+  }, 20000)
 })

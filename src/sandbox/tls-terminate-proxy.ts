@@ -27,6 +27,10 @@ import {
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
+import {
+  prepareBodySubstitution,
+  type GetBodySubstitutions,
+} from './body-substitution.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
 import { sha256Hex } from './aws-sigv4.js'
@@ -134,6 +138,7 @@ export function terminateAndForward(
   ca: MitmCA,
   filterRequest: FilterRequestCallback | undefined,
   mutateHeaders: MutateForwardedHeaders | undefined,
+  getBodySubstitutions: GetBodySubstitutions | undefined,
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
@@ -161,6 +166,7 @@ export function terminateAndForward(
     void forwardUpstream(
       filterRequest,
       mutateHeaders,
+      getBodySubstitutions,
       req,
       res,
       target,
@@ -225,6 +231,7 @@ export function terminateAndForward(
 async function forwardUpstream(
   filterRequest: FilterRequestCallback | undefined,
   mutateHeaders: MutateForwardedHeaders | undefined,
+  getBodySubstitutions: GetBodySubstitutions | undefined,
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
@@ -296,6 +303,15 @@ async function forwardUpstream(
   // completes before any HTTP bytes are written, so mutated headers never
   // reach an unverified server.
   mutateHeaders?.(fwdHeaders, target.hostname)
+  // Masked-credential substitution in the request body, mirroring the
+  // header substitution above. undefined → the bare pipe below, exactly as
+  // before. May delete content-length from fwdHeaders (chunked fallback).
+  const bodyTransform = prepareBodySubstitution(
+    getBodySubstitutions,
+    req,
+    fwdHeaders,
+    target.hostname,
+  )
 
   // SigV4 re-signing runs after substitution so the new signature covers
   // the headers as they actually go upstream (real access key id, real
@@ -310,9 +326,16 @@ async function forwardUpstream(
     let payloadHash = sigv4Plan.payloadHash
     if (payloadHash === undefined) {
       // The client signed a literal body hash: buffer the body and
-      // recompute so the signature covers the bytes actually sent.
+      // recompute so the signature covers the bytes actually sent. Body
+      // substitution runs FIRST — the buffered bytes (and therefore the
+      // hash and signature) must be the substituted body, not the
+      // sentinel-bearing one the client wrote.
+      const bodySource = bodyTransform ? body.pipe(bodyTransform) : body
+      if (bodyTransform) {
+        body.on('error', err => bodyTransform.destroy(err))
+      }
       try {
-        bufferedBody = await collectBody(body, maxSigv4BodyBytes)
+        bufferedBody = await collectBody(bodySource, maxSigv4BodyBytes)
       } catch (err) {
         if (err instanceof BodyTooLargeError) {
           respondDenied(
@@ -327,7 +350,7 @@ async function forwardUpstream(
           )
           // Drain (discarding) whatever the client is still sending so it
           // can read the 403 instead of seeing a reset mid-upload.
-          body.resume()
+          bodySource.resume()
           return
         }
         logForDebugging(
@@ -338,6 +361,13 @@ async function forwardUpstream(
         return
       }
       payloadHash = sha256Hex(bufferedBody)
+      // Substitution may have re-framed the request (Content-Length is
+      // deleted when a sentinel is not length-matched); the body is now
+      // fully buffered so its exact length is known — restore the header
+      // so the upstream leg and any signed content-length stay consistent.
+      if (bodyTransform) {
+        fwdHeaders['content-length'] = String(bufferedBody.length)
+      }
     }
     // Mirror the Host value the runtime derives from {host, port} below.
     const bracketedHost =
@@ -401,7 +431,16 @@ async function forwardUpstream(
 
   res.on('close', () => upstream.destroy())
   if (bufferedBody !== undefined) {
+    // SigV4 literal-hash path: the buffered body already went through
+    // bodyTransform above (when one applied), so send it verbatim.
     upstream.end(bufferedBody)
+  } else if (bodyTransform) {
+    // Errors on either side of the extra pipe stage tear the chain down —
+    // a stalled half-open upstream would otherwise wait for the client.
+    bodyTransform.on('error', err => upstream.destroy(err))
+    body.on('error', err => bodyTransform.destroy(err))
+    res.on('close', () => bodyTransform.destroy())
+    body.pipe(bodyTransform).pipe(upstream)
   } else {
     body.pipe(upstream)
   }
