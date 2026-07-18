@@ -107,6 +107,36 @@ export function peekForClientHello(
   })
 }
 
+/**
+ * Relay `src` into `dst` with paused-mode reads (`'readable'` + `read()`)
+ * instead of `src.pipe(dst)`.
+ *
+ * `pipe()` throttles a flowing source with `pause()`/`resume()`, and under
+ * Bun a socket delivered by an http server's `'connect'` event corrupts its
+ * byte stream across those pause/resume cycles once writes queue (reliably
+ * reproducible with multi-megabyte uploads; the TLS server behind the relay
+ * then fails record MAC verification and the client sees `bad_record_mac` /
+ * a mid-upload reset). Pull-mode reads never call `pause()` and provide the
+ * same flow control: `read()` is only called while `dst` has buffer space,
+ * so the kernel backpressures the peer identically. Do not replace this
+ * with `pipe()` — under Node both are equivalent, but under Bun only this
+ * form is safe for CONNECT-upgraded sockets.
+ */
+function relayPullMode(src: Duplex, dst: Duplex): void {
+  const pump = (): void => {
+    let chunk: Buffer | string | null
+    while ((chunk = src.read() as Buffer | string | null) !== null) {
+      if (!dst.write(chunk)) {
+        dst.once('drain', pump)
+        return
+      }
+    }
+    src.once('readable', pump)
+  }
+  pump()
+  src.once('end', () => dst.end())
+}
+
 export type TerminateTarget = {
   hostname: string
   port: number
@@ -215,7 +245,7 @@ export function terminateAndForward(
       // The caller wrote `200 Connection Established` before sniffing for the
       // ClientHello; `head` holds whatever the sniff consumed.
       if (head.length) loop.write(head)
-      socket.pipe(loop)
+      relayPullMode(socket, loop)
       loop.pipe(socket)
     })
     socket.on('error', () => loop.destroy())

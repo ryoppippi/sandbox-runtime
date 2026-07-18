@@ -530,6 +530,53 @@ describe('literal-hash body buffering cap', () => {
   }, 30000)
 })
 
+describe('multi-megabyte upload through the terminating relay', () => {
+  // Regression test for the client→inner relay in terminateAndForward:
+  // under Bun, pipe()'s pause/resume flow control corrupted the TLS byte
+  // stream once a large upload queued writes (client saw bad_record_mac /
+  // a mid-upload reset). 16 MiB trips the old code near-deterministically;
+  // the relay must deliver every byte intact. See relayPullMode.
+  const SIZE = 16 * 1024 * 1024
+  const stack = makeStack({ maxSigv4ResignBodyBytes: SIZE })
+  const { state } = stack
+  let bodyDir: string
+  let bigFile: string
+
+  beforeAll(async () => {
+    await stack.start()
+    bodyDir = mkdtempSync(join(tmpdir(), 'srt-sigv4-big-'))
+    bigFile = join(bodyDir, 'big')
+    writeFileSync(bigFile, Buffer.alloc(SIZE, 'a'))
+  })
+  afterAll(async () => {
+    rmSync(bodyDir, { recursive: true, force: true })
+    await stack.stop()
+  })
+
+  test('a 16 MiB literal-hash PUT uploads intact and re-signs', async () => {
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/big`,
+      {
+        method: 'PUT',
+        dataFile: bigFile,
+        awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret },
+        headers: ['Expect:'],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.length).toBe(SIZE)
+    // Byte-intact, not just length-intact: the historical failure mode was
+    // corruption inside the stream, which TLS turns into a hard error, but
+    // assert content anyway so a silent-corruption regression cannot pass.
+    expect(captured.body.every(b => b === 0x61)).toBe(true)
+    verifyUpstreamSignature(captured)
+  }, 30000)
+})
+
 describe('policies for non-re-signable SigV4 shapes', () => {
   function streamingHeaders(fakeAkid: string): string[] {
     return [
